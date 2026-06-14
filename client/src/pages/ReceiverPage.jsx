@@ -5,23 +5,34 @@
  * passed when navigating here:
  *
  *  • Sender lands here  (state.role === 'sender') after a peer joins.
- *    Stage 4 will read state.file and state.peerId to start the WebRTC
- *    offer. For now we render a "peer connected" waiting screen.
+ *    Stage 4 reads state.file and state.peerId to start the WebRTC offer.
  *
  *  • Receiver lands here directly via the share link (no router state).
  *    We emit 'join-room' immediately on mount, then handle the responses.
  *
- * Stage 3 responsibilities:
+ * Stage 3 responsibilities (done):
  *   - join-room / room-joined / signaling-error handling
  *   - peer-left graceful disconnect message
  *   - Clear UI for every state: joining → connected → peer left → error
  *
- * Stage 4 will add the WebRTC layer on top of this scaffold.
+ * Stage 4 responsibilities (this file):
+ *   - Once in the 'connected' phase and we know the peer's socket ID,
+ *     mount `useWebRTC` to open an RTCPeerConnection + data channel.
+ *   - Show a live connection status badge (connecting / connected / failed).
+ *   - Tear down the peer connection on `peer-left` or unmount (handled
+ *     inside useWebRTC's cleanup, triggered by this component unmounting
+ *     or peerId changing).
+ *
+ * Stage 5 will use the `dataChannel` returned by useWebRTC to start
+ * sending/receiving file data. The data channel label ('file-transfer')
+ * and bufferedAmountLowThreshold (64 KB) are already configured in
+ * useWebRTC.js — don't change them without updating Stage 5 too.
  */
 
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useSignalingSocket } from '../hooks/useSignalingSocket';
+import { useWebRTC } from '../hooks/useWebRTC';
 
 export default function ReceiverPage() {
   const { roomId } = useParams();
@@ -37,10 +48,14 @@ export default function ReceiverPage() {
   const [phase, setPhase] = useState(isSender ? 'connected' : 'joining');
   const [errorMsg, setErrorMsg] = useState('');
 
-  // For the sender role, Stage 4 will pull these from routerState.
-  // We store them in refs so they're stable across renders.
+  // For the sender role, these come straight from routerState. For the
+  // receiver role, peerIdRef is filled in once 'room-joined' arrives.
   const fileRef = useRef(routerState.file ?? null);
   const peerIdRef = useRef(routerState.peerId ?? null);
+
+  // Mirror peerIdRef into state so useWebRTC re-runs once we know it
+  // (receiver role learns this asynchronously from 'room-joined').
+  const [peerId, setPeerId] = useState(routerState.peerId ?? null);
 
   // ─── Socket listeners ──────────────────────────────────────────────
   useEffect(() => {
@@ -53,8 +68,10 @@ export default function ReceiverPage() {
       socket.emit('join-room', { roomId });
 
       function onRoomJoined({ peerIds }) {
-        // peerIds[0] is the sender's socket ID — Stage 4 sends the offer to them.
-        peerIdRef.current = peerIds[0] ?? null;
+        // peerIds[0] is the sender's socket ID — used to send the answer.
+        const senderId = peerIds[0] ?? null;
+        peerIdRef.current = senderId;
+        setPeerId(senderId);
         setPhase('connected');
       }
 
@@ -73,8 +90,7 @@ export default function ReceiverPage() {
     }
 
     // ── Sender path (navigated here by SenderPage after peer-joined) ─
-    // Nothing to do for signaling at this point. Stage 4 will emit the
-    // WebRTC offer from here using peerIdRef.current.
+    // peerId already set from router state via initial useState above.
   }, [socketRef, isSender, roomId]);
 
   // ─── peer-left (both roles) ────────────────────────────────────────
@@ -84,11 +100,21 @@ export default function ReceiverPage() {
 
     function onPeerLeft() {
       setPhase('peer-left');
+      setPeerId(null);
     }
 
     socket.on('peer-left', onPeerLeft);
     return () => socket.off('peer-left', onPeerLeft);
   }, [socketRef]);
+
+  // ─── Stage 4: WebRTC peer connection ───────────────────────────────
+  // Only attempt to connect once we're in the 'connected' phase and know
+  // the other peer's socket ID. useWebRTC handles its own cleanup when
+  // peerId becomes null (e.g. on peer-left) or this component unmounts.
+  const role = isSender ? 'sender' : 'receiver';
+  const webrtcPeerId = phase === 'connected' ? peerId : null;
+  const { connectionState, iceConnectionState, error: webrtcError } =
+    useWebRTC({ socketRef, role, peerId: webrtcPeerId });
 
   // ─── Render helpers ───────────────────────────────────────────────
   function handleGoHome() {
@@ -161,7 +187,8 @@ export default function ReceiverPage() {
 
   // ─── Phase: connected ─────────────────────────────────────────────
   // Both sender and receiver land here once both peers are in the room.
-  // Stage 4 will mount the WebRTC + transfer UI on top of this.
+  // Stage 4 mounts the WebRTC status UI here; Stage 5 will add the
+  // transfer UI on top of this.
   return (
     <CenteredLayout>
       <div className="w-full max-w-lg space-y-8">
@@ -223,14 +250,12 @@ export default function ReceiverPage() {
             </div>
           )}
 
-          {/* Stage 4 placeholder notice */}
-          <div className="rounded-lg border border-dashed border-slate-700 px-4 py-3 text-center">
-            <p className="text-slate-500 text-xs">
-              {isSender
-                ? '⚡ Stage 4 will begin the WebRTC transfer here.'
-                : '⚡ Stage 4 will stream the file here once the sender initiates.'}
-            </p>
-          </div>
+          {/* Stage 4: WebRTC connection status */}
+          <WebRTCStatus
+            connectionState={connectionState}
+            iceConnectionState={iceConnectionState}
+            error={webrtcError}
+          />
         </div>
 
         <button
@@ -243,6 +268,66 @@ export default function ReceiverPage() {
       </div>
     </CenteredLayout>
   );
+}
+
+// ─── Stage 4: WebRTC status badge ──────────────────────────────────────
+
+function WebRTCStatus({ connectionState, iceConnectionState, error }) {
+  const config = getStatusConfig(connectionState, error);
+
+  return (
+    <div className="rounded-lg border border-dashed border-slate-700 px-4 py-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-slate-500 text-xs uppercase tracking-wider">
+          P2P connection
+        </span>
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${config.badgeClass}`}
+        >
+          <span className={`w-1.5 h-1.5 rounded-full ${config.dotClass}`} />
+          {config.label}
+        </span>
+      </div>
+      <p className="text-slate-500 text-xs">
+        ICE state: <span className="font-mono">{iceConnectionState}</span>
+      </p>
+      {error && (
+        <p role="alert" className="text-red-400 text-xs">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function getStatusConfig(connectionState, error) {
+  if (error || connectionState === 'failed') {
+    return {
+      label: 'Failed',
+      badgeClass: 'bg-red-500/10 text-red-400',
+      dotClass: 'bg-red-400',
+    };
+  }
+  if (connectionState === 'connected') {
+    return {
+      label: 'Connected',
+      badgeClass: 'bg-emerald-500/10 text-emerald-400',
+      dotClass: 'bg-emerald-400',
+    };
+  }
+  if (connectionState === 'disconnected' || connectionState === 'closed') {
+    return {
+      label: 'Disconnected',
+      badgeClass: 'bg-slate-700/60 text-slate-400',
+      dotClass: 'bg-slate-400',
+    };
+  }
+  // 'new', 'connecting'
+  return {
+    label: 'Connecting…',
+    badgeClass: 'bg-amber-500/10 text-amber-400',
+    dotClass: 'bg-amber-400 animate-pulse',
+  };
 }
 
 // ─── Small utilities ──────────────────────────────────────────────────
