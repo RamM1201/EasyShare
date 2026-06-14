@@ -1,359 +1,426 @@
-// client/src/pages/ReceiverPage.jsx
-// Stage 8: Transfer speed, connection badge, hardened disconnect handling
+/**
+ * ReceiverPage.jsx
+ *
+ * Rendered at /r/:roomId for both the sender (after room creation) and the
+ * receiver (who opens the share link).
+ *
+ * - Sender:   joins the room as 'sender', waits for receiver, then sends the file.
+ * - Receiver: joins the room as 'receiver', waits for the WebRTC data channel,
+ *             then receives, verifies, and auto-downloads the file.
+ */
 
-import { useEffect, useRef, useState } from 'react';
-import { useParams, useLocation } from 'react-router-dom';
-import { useSignalingSocket } from '../hooks/useSignalingSocket';
-import { useWebRTC } from '../hooks/useWebRTC';
-import { useFileTransfer } from '../hooks/useFileTransfer';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { useParams, useLocation, useNavigate } from 'react-router-dom';
+import useSignalingSocket from '../hooks/useSignalingSocket';
+import useWebRTC          from '../hooks/useWebRTC';
+import useFileTransfer    from '../hooks/useFileTransfer';
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function fmtBytes(n) {
-  if (!n) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(n) / Math.log(k));
-  return `${(n / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+/** Format bytes to a human-readable string. */
+function formatBytes(bytes) {
+  if (bytes < 1024)             return `${bytes} B`;
+  if (bytes < 1024 * 1024)     return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// Stage 8: format bytes/sec → "X.X MB/s" or "X KB/s"
-function fmtSpeed(bytesPerSec) {
-  if (!bytesPerSec || bytesPerSec <= 0) return '—';
-  if (bytesPerSec >= 1024 * 1024) {
-    return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-  }
-  return `${Math.round(bytesPerSec / 1024)} KB/s`;
+/** Format bytes/sec to MB/s or KB/s string. */
+function formatSpeed(bps) {
+  if (bps <= 0)          return '—';
+  if (bps >= 1024 * 1024) return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
+  return `${(bps / 1024).toFixed(0)} KB/s`;
 }
 
-// ── ConnectionBadge ───────────────────────────────────────────────────────────
-// Stage 8: persistent header badge reflecting connection state
-function ConnectionBadge({ connectionStatus }) {
-  const configs = {
-    connecting:    { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Connecting…' },
-    waiting:       { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Waiting for peer…' },
-    connected:     { dot: 'bg-green-400',                text: 'text-green-300',  label: 'Connected' },
-    disconnected:  { dot: 'bg-red-500',                  text: 'text-red-400',    label: 'Disconnected' },
-    interrupted:   { dot: 'bg-orange-500',               text: 'text-orange-400', label: 'Transfer interrupted' },
-    error:         { dot: 'bg-red-500',                  text: 'text-red-400',    label: 'Error' },
-  };
-  const cfg = configs[connectionStatus] ?? configs.connecting;
+// ── ConnectionBadge ──────────────────────────────────────────────────────────
 
+const BADGE_CONFIG = {
+  connecting:   { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300',  label: 'Connecting…'           },
+  waiting:      { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300',  label: 'Waiting for peer…'     },
+  connected:    { dot: 'bg-green-400',                text: 'text-green-300',   label: 'Connected'             },
+  interrupted:  { dot: 'bg-orange-400',               text: 'text-orange-300',  label: 'Transfer interrupted'  },
+  disconnected: { dot: 'bg-red-400',                  text: 'text-red-300',     label: 'Disconnected'          },
+  error:        { dot: 'bg-red-400',                  text: 'text-red-300',     label: 'Error'                 },
+  done:         { dot: 'bg-green-400',                text: 'text-green-300',   label: 'Transfer complete'     },
+};
+
+function ConnectionBadge({ status }) {
+  const cfg = BADGE_CONFIG[status] ?? BADGE_CONFIG.connecting;
   return (
-    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-xs font-medium ${cfg.text}`}>
-      <span className={`w-2 h-2 rounded-full ${cfg.dot}`} />
-      {cfg.label}
-    </div>
+    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-gray-800 border border-gray-700">
+      <span className={`w-2 h-2 rounded-full ${cfg.dot}`} aria-hidden="true" />
+      <span className={`text-xs font-medium ${cfg.text}`}>{cfg.label}</span>
+    </span>
   );
 }
 
-// ── TransferProgress ──────────────────────────────────────────────────────────
-function TransferProgress({ status, progress, bytesTransferred, totalBytes, chunksReceived, totalChunks, transferSpeed, error }) {
-  if (status === 'error') {
-    return (
-      <div className="mt-4 p-4 bg-red-50 border border-red-300 rounded-lg text-red-700">
-        <p className="font-semibold">❌ Integrity check failed</p>
-        <p className="text-sm mt-1">{error}</p>
-      </div>
-    );
-  }
+// ── TransferProgress ─────────────────────────────────────────────────────────
 
-  if (status === 'verifying') {
-    return (
-      <div className="mt-4 p-4 bg-yellow-50 border border-yellow-300 rounded-lg">
-        <div className="flex items-center gap-2 text-yellow-700">
-          <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-          </svg>
-          <span className="font-medium">Verifying file integrity…</span>
-        </div>
-        <p className="text-xs text-yellow-600 mt-1">Computing SHA-256 hash of received file</p>
-      </div>
-    );
-  }
-
+function TransferProgress({ progress, bytesTransferred, totalBytes, speed, status }) {
   const isDone = status === 'done';
-
   return (
-    <div className="mt-4">
-      {/* Stage 8: top row — label + percentage + speed */}
-      <div className="flex justify-between items-baseline text-sm text-gray-600 mb-1">
-        <span>{isDone ? 'Complete' : 'Transferring…'}</span>
-        <div className="flex items-baseline gap-3">
-          {/* Stage 8: speed display */}
-          {!isDone && (
-            <span className="text-xs text-gray-400 font-mono">
-              {fmtSpeed(transferSpeed)}
-            </span>
-          )}
-          <span className="font-semibold">{progress}%</span>
-        </div>
-      </div>
-
-      {/* Progress bar */}
-      <div className="w-full bg-gray-200 rounded-full h-2.5">
+    <div className="space-y-2">
+      {/* Bar */}
+      <div className="w-full bg-gray-700 rounded-full h-2 overflow-hidden">
         <div
-          className={`h-2.5 rounded-full transition-all duration-200 ${isDone ? 'bg-green-500' : 'bg-blue-500'}`}
+          className={[
+            'h-2 rounded-full transition-all duration-300',
+            isDone ? 'bg-green-500' : 'bg-indigo-500',
+          ].join(' ')}
           style={{ width: `${progress}%` }}
+          role="progressbar"
+          aria-valuenow={progress}
+          aria-valuemin={0}
+          aria-valuemax={100}
         />
       </div>
-
-      {/* Stage 8: bottom row — bytes + chunk count */}
-      <div className="flex justify-between text-xs text-gray-500 mt-1">
-        <span>{fmtBytes(bytesTransferred)} / {fmtBytes(totalBytes)}</span>
-        {chunksReceived > 0 && (
-          <span>Chunks: {chunksReceived} / {totalChunks}</span>
-        )}
+      {/* Stats row */}
+      <div className="flex items-center justify-between text-xs text-gray-400">
+        <span>
+          {formatBytes(bytesTransferred)} / {formatBytes(totalBytes)}
+        </span>
+        <span className="flex items-center gap-2">
+          {!isDone && status === 'transferring' && (
+            <span className="text-indigo-300">{formatSpeed(speed)}</span>
+          )}
+          <span className="tabular-nums font-medium text-white">{progress}%</span>
+        </span>
       </div>
     </div>
   );
 }
 
-// ── ReceiverPage ──────────────────────────────────────────────────────────────
+// ── Main page ────────────────────────────────────────────────────────────────
+
 export default function ReceiverPage() {
-  const { roomId } = useParams();
-  const location = useLocation();
-  const isSender = location.state?.role === 'sender';
-  const fileFromState = location.state?.file ?? null;
-  const peerIdFromState = location.state?.peerId ?? null;
+  const { roomId }  = useParams();
+  const location    = useLocation();
+  const navigate    = useNavigate();
+  const socketRef   = useSignalingSocket();
 
-  const socketRef = useSignalingSocket();
-  const socket = socketRef.current;
+  // Determine role from router state (sender navigated here; receiver opens URL directly)
+  const isSender    = location.state?.role === 'sender';
+  const fileToSend  = location.state?.file ?? null;
 
+  const [peerId,           setPeerId]           = useState(location.state?.peerId ?? null);
+  const [joinError,        setJoinError]         = useState('');
   const [connectionStatus, setConnectionStatus] = useState('connecting');
-  const [peerSocketId, setPeerSocketId] = useState(peerIdFromState);
-  const [signalingError, setSignalingError] = useState(null);
+  const [copyLabel,        setCopyLabel]         = useState('Copy link');
+  const [isHashing,        setIsHashing]         = useState(false);
 
-  const role = isSender ? 'sender' : 'receiver';
-  const fileRef = useRef(fileFromState);
+  const hasJoinedRef   = useRef(false);
+  const downloadedRef  = useRef(false);
 
-  // Stage 7: guards auto-download against StrictMode double-invoke
-  const downloadedRef = useRef(false);
-  const [downloadUrl, setDownloadUrl] = useState(null);
-  const [downloadName, setDownloadName] = useState('');
+  const shareUrl = `${window.location.origin}/r/${roomId}`;
 
-  // ── Signaling ─────────────────────────────────────────────────────────────
+  // ── Join room (receiver only) ──────────────────────────────────────────
   useEffect(() => {
+    if (isSender || hasJoinedRef.current) return;
+    const socket = socketRef.current;
     if (!socket) return;
-
-    if (!isSender) {
-      socket.emit('join-room', { roomId });
-    }
+    hasJoinedRef.current = true;
 
     const onRoomJoined = ({ peerIds }) => {
-      setPeerSocketId(peerIds[0]);
-      setConnectionStatus('waiting');
-    };
-    const onPeerJoined = ({ peerId }) => setPeerSocketId(peerId);
-    const onPeerLeft = () => {
-      // Stage 8: connection status update happens in the main component body
-      // based on transfer status — set to disconnected here as a fallback
-      setConnectionStatus(prev =>
-        prev === 'connected' ? 'disconnected' : prev
-      );
-    };
-    const onSignalingError = ({ message }) => {
-      setSignalingError(message);
-      setConnectionStatus('error');
+      // peerIds[0] is the sender's socket ID
+      if (peerIds.length > 0) setPeerId(peerIds[0]);
     };
 
-    socket.on('room-joined', onRoomJoined);
-    socket.on('peer-joined', onPeerJoined);
-    socket.on('peer-left', onPeerLeft);
-    socket.on('signaling-error', onSignalingError);
+    const onPeerJoined = ({ peerId: id }) => {
+      setPeerId(id);
+    };
+
+    const onError = ({ message, reason }) => {
+      if (reason === 'not-found') {
+        setJoinError('Room not found. The link may have expired.');
+      } else if (reason === 'full') {
+        setJoinError('This room already has two participants.');
+      } else {
+        setJoinError(message || 'Could not join room.');
+      }
+    };
+
+    socket.on('room-joined',  onRoomJoined);
+    socket.on('peer-joined',  onPeerJoined);
+    socket.on('signaling-error', onError);
+    socket.emit('join-room', { roomId });
 
     return () => {
-      socket.off('room-joined', onRoomJoined);
-      socket.off('peer-joined', onPeerJoined);
-      socket.off('peer-left', onPeerLeft);
-      socket.off('signaling-error', onSignalingError);
+      socket.off('room-joined',  onRoomJoined);
+      socket.off('peer-joined',  onPeerJoined);
+      socket.off('signaling-error', onError);
     };
-  }, [socket, isSender, roomId]);
+  }, [isSender, roomId, socketRef]);
 
-  // ── WebRTC ────────────────────────────────────────────────────────────────
-  // Stage 8: useWebRTC now accepts `socket` directly (not socketRef)
-  // and exposes `peerLeft`
-  const { dataChannel, connectionState, peerLeft } = useWebRTC({
-    socket,
-    role,
-    peerId: peerSocketId,
-  });
-
+  // ── Sender: wait for peer then navigate (already on this page) ────────
   useEffect(() => {
-    if (connectionState === 'connected') setConnectionStatus('connected');
-    else if (connectionState === 'failed' || connectionState === 'disconnected') {
-      setConnectionStatus('disconnected');
-    }
-  }, [connectionState]);
+    if (!isSender) return;
+    const socket = socketRef.current;
+    if (!socket) return;
 
-  // ── File transfer ─────────────────────────────────────────────────────────
+    const onPeerJoined = ({ peerId: id }) => {
+      setPeerId(id);
+    };
+
+    socket.on('peer-joined', onPeerJoined);
+    return () => socket.off('peer-joined', onPeerJoined);
+  }, [isSender, socketRef]);
+
+  // ── WebRTC ─────────────────────────────────────────────────────────────
+  const { dataChannel, connectionState, error: rtcError, peerLeft } =
+    useWebRTC({
+      socket: socketRef.current,
+      role:   isSender ? 'sender' : 'receiver',
+      peerId,
+    });
+
+  // ── File transfer ──────────────────────────────────────────────────────
   const {
     status,
     progress,
     bytesTransferred,
     totalBytes,
-    chunksReceived,
-    totalChunks,
+    transferSpeed,
     receivedMetadata,
     receivedChunks,
-    error,
-    transferSpeed,  // Stage 8
+    error: transferError,
   } = useFileTransfer({
     dataChannel,
-    role,
-    file: fileRef.current,
+    role:  isSender ? 'sender' : 'receiver',
+    file:  fileToSend,
   });
 
-  // ── Stage 8: handle peerLeft scenarios ────────────────────────────────────
+  // ── Derive connection badge status ────────────────────────────────────
+  useEffect(() => {
+    if (transferError || rtcError) {
+      setConnectionStatus('error');
+    } else if (status === 'done') {
+      setConnectionStatus('done');
+    } else if (peerLeft) {
+      // handled separately below
+    } else if (connectionState === 'connected') {
+      setConnectionStatus('connected');
+    } else if (connectionState === 'failed' || connectionState === 'disconnected') {
+      setConnectionStatus('disconnected');
+    } else if (peerId) {
+      setConnectionStatus('connecting');
+    } else {
+      setConnectionStatus('waiting');
+    }
+  }, [connectionState, status, peerId, peerLeft, transferError, rtcError]);
+
+  // ── Peer-left: handle all three disconnect scenarios ──────────────────
   useEffect(() => {
     if (!peerLeft) return;
-
-    if (status === 'transferring') {
-      // Mid-transfer disconnect
+    if (status === 'done') return;           // transfer already finished — ignore
+    if (status === 'transferring' || status === 'verifying') {
       setConnectionStatus('interrupted');
-    } else if (status === 'done') {
-      // Transfer already finished — don't disrupt the success screen
     } else {
-      // Before transfer started
       setConnectionStatus('disconnected');
     }
   }, [peerLeft, status]);
 
-  // ── Stage 7: Auto-download ─────────────────────────────────────────────────
+  // ── Auto-download when done (receiver only) ───────────────────────────
   useEffect(() => {
-    if (isSender) return;
-    if (status !== 'done') return;
-    if (!receivedChunks || !receivedMetadata) return;
-    if (downloadedRef.current) return;
+    if (isSender)                     return;
+    if (status !== 'done')            return;
+    if (downloadedRef.current)        return;
+    if (!receivedChunks.length)       return;
+    if (!receivedMetadata)            return;
+
     downloadedRef.current = true;
 
     const blob = new Blob(receivedChunks, {
       type: receivedMetadata.mimeType || 'application/octet-stream',
     });
-    const fileName = receivedMetadata.name;
-
-    const url = URL.createObjectURL(blob);
-    setDownloadUrl(url);
-    setDownloadName(fileName);
-
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = receivedMetadata.name;
     a.click();
-    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [isSender, status, receivedChunks, receivedMetadata]);
 
-    console.log('[ReceiverPage] auto-download triggered:', fileName);
-  }, [status, receivedChunks, receivedMetadata, isSender]);
+  // ── Copy share link ───────────────────────────────────────────────────
+  const handleCopy = useCallback(() => {
+    navigator.clipboard.writeText(shareUrl).then(() => {
+      setCopyLabel('Copied!');
+      setTimeout(() => setCopyLabel('Copy link'), 2000);
+    });
+  }, [shareUrl]);
 
-  // Revoke Blob URL on unmount
-  useEffect(() => {
-    return () => {
-      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
-    };
-  }, [downloadUrl]);
+  // ── Derived display values ────────────────────────────────────────────
+  const displayName = isSender
+    ? (fileToSend?.name ?? 'File')
+    : (receivedMetadata?.name ?? '—');
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  const displaySize = isSender
+    ? (fileToSend?.size != null ? formatBytes(fileToSend.size) : '—')
+    : (receivedMetadata?.size != null ? formatBytes(receivedMetadata.size) : '—');
+
+  const showProgress = status === 'transferring' || status === 'verifying' || status === 'done';
+
+  // ── Render ────────────────────────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-6">
-      <div className="bg-white rounded-2xl shadow-lg p-8 w-full max-w-md">
+    <div className="min-h-screen bg-gray-950 flex flex-col items-center justify-center px-4 py-12">
 
-        {/* Stage 8: header with title + connection badge */}
-        <div className="flex items-start justify-between mb-2">
-          <h1 className="text-2xl font-bold text-gray-800">
-            {isSender ? '📤 Sending File' : '📥 Receiving File'}
-          </h1>
-          <ConnectionBadge connectionStatus={connectionStatus} />
+      {/* Logo */}
+      <div className="mb-8 text-center">
+        <h1 className="text-3xl font-bold text-white tracking-tight">
+          Easy<span className="text-indigo-400">Share</span>
+        </h1>
+      </div>
+
+      {/* Join error (room not found / full) */}
+      {joinError && (
+        <div className="w-full max-w-md bg-red-950/50 border border-red-800 rounded-2xl p-5 mb-4 text-center">
+          <p className="text-sm text-red-300 font-medium">⚠️ {joinError}</p>
+          <button
+            onClick={() => navigate('/')}
+            className="mt-3 text-sm text-indigo-400 underline underline-offset-2 hover:text-indigo-300"
+          >
+            Back to home
+          </button>
         </div>
+      )}
 
-        <p className="text-sm text-gray-500 mb-6">
-          Room: <span className="font-mono font-semibold">{roomId}</span>
-        </p>
+      {/* Main card */}
+      {!joinError && (
+        <div className="w-full max-w-md bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl overflow-hidden">
 
-        {/* File info — sender */}
-        {isSender && fileRef.current && (
-          <div className="bg-gray-50 rounded-lg p-3 mb-4 text-sm text-gray-700">
-            <p className="font-medium truncate">{fileRef.current.name}</p>
-            <p className="text-gray-500">{fmtBytes(fileRef.current.size)}</p>
+          {/* Card header */}
+          <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
+            <div>
+              <p className="text-xs text-gray-500 uppercase tracking-wider font-medium">
+                {isSender ? 'Sending' : 'Receiving'}
+              </p>
+              <p className="text-sm font-semibold text-white mt-0.5 break-all line-clamp-1" title={displayName}>
+                {displayName}
+              </p>
+              {displaySize !== '—' && (
+                <p className="text-xs text-gray-400">{displaySize}</p>
+              )}
+            </div>
+            <ConnectionBadge status={connectionStatus} />
           </div>
-        )}
 
-        {/* File info — receiver (from metadata) */}
-        {!isSender && receivedMetadata && (
-          <div className="bg-gray-50 rounded-lg p-3 mb-4 text-sm text-gray-700">
-            <p className="font-medium truncate">{receivedMetadata.name}</p>
-            <p className="text-gray-500">{fmtBytes(receivedMetadata.size)}</p>
-          </div>
-        )}
+          {/* Card body */}
+          <div className="px-5 py-5 space-y-5">
 
-        {/* Progress / verifying / error */}
-        {['transferring', 'verifying', 'done', 'error'].includes(status) && (
-          <TransferProgress
-            status={status}
-            progress={progress}
-            bytesTransferred={bytesTransferred}
-            totalBytes={totalBytes}
-            chunksReceived={chunksReceived}
-            totalChunks={totalChunks}
-            transferSpeed={transferSpeed}
-            error={error}
-          />
-        )}
+            {/* Room ID */}
+            <div className="flex items-center justify-between bg-gray-800 rounded-lg px-4 py-3">
+              <div>
+                <p className="text-xs text-gray-500 uppercase tracking-wider">Room</p>
+                <p className="text-lg font-mono font-bold text-white tracking-widest">{roomId}</p>
+              </div>
+              <button
+                onClick={handleCopy}
+                className="text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-800 hover:border-indigo-600 rounded-lg px-3 py-1.5 transition-colors"
+              >
+                {copyLabel}
+              </button>
+            </div>
 
-        {/* Completion */}
-        {status === 'done' && (
-          <div className="mt-4 p-4 bg-green-50 border border-green-300 rounded-lg text-green-700">
-            {isSender ? (
-              <p className="font-semibold">✅ File sent successfully</p>
-            ) : (
-              <>
-                <p className="font-semibold">✅ Transfer complete — ✓ Verified</p>
-                <p className="text-sm mt-1">
-                  {chunksReceived} chunks received &amp; SHA-256 verified.
-                  Your download has started automatically.
+            {/* Sender: waiting for peer prompt */}
+            {isSender && connectionStatus === 'waiting' && (
+              <div className="text-center py-4 space-y-2">
+                <p className="text-sm text-gray-300">Share this link with the recipient:</p>
+                <div className="flex items-center gap-2 bg-gray-800 rounded-lg px-3 py-2">
+                  <p className="flex-1 text-xs text-indigo-300 break-all font-mono">{shareUrl}</p>
+                </div>
+                <p className="text-xs text-gray-500">Waiting for them to connect…</p>
+              </div>
+            )}
+
+            {/* Receiver: waiting for sender */}
+            {!isSender && connectionStatus === 'waiting' && (
+              <div className="text-center py-4">
+                <div className="flex justify-center mb-3">
+                  <PulseIcon />
+                </div>
+                <p className="text-sm text-gray-300">Waiting for the sender to connect…</p>
+              </div>
+            )}
+
+            {/* Transfer progress */}
+            {showProgress && (
+              <TransferProgress
+                progress={progress}
+                bytesTransferred={bytesTransferred}
+                totalBytes={totalBytes}
+                speed={transferSpeed}
+                status={status}
+              />
+            )}
+
+            {/* Verifying state */}
+            {status === 'verifying' && (
+              <p className="text-xs text-center text-indigo-300 animate-pulse">
+                Verifying file integrity…
+              </p>
+            )}
+
+            {/* Done: receiver */}
+            {status === 'done' && !isSender && (
+              <div className="bg-green-950/40 border border-green-800 rounded-xl p-4 text-center space-y-1">
+                <p className="text-sm font-semibold text-green-300">✅ Transfer complete</p>
+                <p className="text-xs text-green-400/80">
+                  {receivedMetadata?.name} has been saved to your downloads.
                 </p>
-                {downloadUrl && (
-                  <a
-                    href={downloadUrl}
-                    download={downloadName}
-                    className="mt-3 inline-block px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition-colors"
-                  >
-                    ⬇️ Download again
-                  </a>
-                )}
-              </>
+              </div>
+            )}
+
+            {/* Done: sender */}
+            {status === 'done' && isSender && (
+              <div className="bg-green-950/40 border border-green-800 rounded-xl p-4 text-center">
+                <p className="text-sm font-semibold text-green-300">✅ File sent successfully</p>
+              </div>
+            )}
+
+            {/* Transfer error */}
+            {(transferError || rtcError) && (
+              <div className="bg-red-950/40 border border-red-800 rounded-xl p-4 space-y-2">
+                <p className="text-sm font-semibold text-red-300">⚠️ Transfer error</p>
+                <p className="text-xs text-red-400/80">{transferError || rtcError}</p>
+              </div>
+            )}
+
+            {/* Disconnect: interrupted mid-transfer */}
+            {connectionStatus === 'interrupted' && !transferError && (
+              <div className="bg-orange-950/40 border border-orange-800 rounded-xl p-4 space-y-1">
+                <p className="text-sm font-semibold text-orange-300">⚠️ Peer disconnected mid-transfer</p>
+                <p className="text-xs text-orange-400/80">The file is incomplete and cannot be recovered.</p>
+              </div>
+            )}
+
+            {/* Disconnect: before transfer started */}
+            {connectionStatus === 'disconnected' && !transferError && status !== 'done' && (
+              <div className="bg-gray-800 border border-gray-700 rounded-xl p-4">
+                <p className="text-sm text-gray-300">🔴 Peer disconnected before the transfer started.</p>
+              </div>
+            )}
+
+            {/* Back to home */}
+            {(connectionStatus === 'disconnected'
+              || connectionStatus === 'interrupted'
+              || connectionStatus === 'error'
+              || status === 'done') && (
+              <button
+                onClick={() => navigate('/')}
+                className="w-full text-sm text-center text-indigo-400 hover:text-indigo-300 underline underline-offset-2 transition-colors"
+              >
+                ← Start a new transfer
+              </button>
             )}
           </div>
-        )}
-
-        {/* Stage 8: sender error from closed channel */}
-        {isSender && status === 'error' && (
-          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
-            ❌ {error || 'Transfer failed.'}
-          </div>
-        )}
-
-        {/* Stage 8: Disconnect scenarios — receiver side */}
-        {!isSender && connectionStatus === 'interrupted' && status !== 'done' && (
-          <div className="mt-4 p-3 bg-orange-50 border border-orange-200 rounded-lg text-orange-700 text-sm">
-            <p className="font-semibold">⚠️ Peer disconnected mid-transfer.</p>
-            <p className="mt-1">The file is incomplete and cannot be recovered.</p>
-          </div>
-        )}
-
-        {!isSender && connectionStatus === 'disconnected' && status === 'idle' && (
-          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
-            🔴 Peer disconnected before transfer started.
-          </div>
-        )}
-
-        {/* Generic disconnected fallback (not mid-transfer, not idle) */}
-        {connectionStatus === 'disconnected' && status !== 'done' && status !== 'idle' && connectionStatus !== 'interrupted' && (
-          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
-            The other peer disconnected.
-          </div>
-        )}
-      </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+/** Animated pulse icon for "waiting" state. */
+function PulseIcon() {
+  return (
+    <svg className="w-8 h-8 text-indigo-500 animate-pulse" fill="none" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 2" />
+      <circle cx="12" cy="12" r="4"  fill="currentColor" />
+    </svg>
   );
 }
