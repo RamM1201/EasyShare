@@ -77,6 +77,7 @@ export default function useWebRTC({ socket, role, peerId }) {
     // ── Data channel setup (sender creates, receiver receives) ────────────
     if (role === 'sender') {
       const dc = pc.createDataChannel('file-transfer');
+      dc.binaryType = 'arraybuffer';  
       dc.bufferedAmountLowThreshold = 64 * 1024;
       setDataChannel(dc);
 
@@ -95,6 +96,7 @@ export default function useWebRTC({ socket, role, peerId }) {
     } else {
       // Receiver: data channel arrives via ondatachannel
       pc.ondatachannel = ({ channel }) => {
+        channel.binaryType = 'arraybuffer';
         setDataChannel(channel);
       };
     }

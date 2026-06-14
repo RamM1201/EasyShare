@@ -142,6 +142,7 @@ export default function ReceiverPage() {
     socket.emit('join-room', { roomId });
 
     return () => {
+      hasJoinedRef.current = false;
       socket.off('room-joined',  onRoomJoined);
       socket.off('peer-joined',  onPeerJoined);
       socket.off('signaling-error', onError);

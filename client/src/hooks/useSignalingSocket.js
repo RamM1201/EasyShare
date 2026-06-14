@@ -1,15 +1,13 @@
 /**
  * useSignalingSocket — shared Socket.io connection hook.
  *
- * Returns a stable socket instance that connects once on mount and
- * disconnects on unmount. Stage 4 (WebRTC) will consume the same socket
- * from this hook rather than creating a second connection.
+ * Returns a stable socketRef whose .current is the raw socket.io-client
+ * instance. Connects once on first mount, disconnects when all consumers
+ * unmount.
  *
  * Usage:
- *   const socket = useSignalingSocket();
- *
- * The returned socket is the raw socket.io-client instance, so callers
- * can do socket.emit(...) and socket.on(...) directly.
+ *   const socketRef = useSignalingSocket();
+ *   socketRef.current.emit('create-room');
  */
 
 import { useEffect, useRef } from 'react';
@@ -26,7 +24,6 @@ let _refCount = 0;
 function getSocket() {
   if (!_socket || _socket.disconnected) {
     _socket = io(SIGNALING_SERVER_URL, {
-      // Reconnect automatically on transient network blips.
       reconnection: true,
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,
@@ -45,7 +42,6 @@ export function useSignalingSocket() {
 
     return () => {
       _refCount -= 1;
-      // Only fully disconnect when no component is using the socket.
       if (_refCount === 0 && _socket) {
         _socket.disconnect();
         _socket = null;
@@ -55,3 +51,7 @@ export function useSignalingSocket() {
 
   return socketRef;
 }
+
+// Default export so pages can do:
+//   import useSignalingSocket from '../hooks/useSignalingSocket'
+export default useSignalingSocket;
