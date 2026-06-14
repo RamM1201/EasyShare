@@ -20,8 +20,6 @@ import {
 export function registerSignalingHandlers(io, socket) {
   // --- Create a new room -------------------------------------------------
   socket.on('create-room', () => {
-    // A socket can only be the "creator" of one room at a time. If this
-    // socket is somehow already in a room, leave it first.
     if (getRoomIdForSocket(socket.id)) {
       handleLeave(io, socket);
     }
@@ -57,15 +55,11 @@ export function registerSignalingHandlers(io, socket) {
 
     socket.join(roomId.toUpperCase());
 
-    // Tell the joining peer who is already in the room (for MVP, exactly
-    // one other peer).
     socket.emit('room-joined', {
       roomId: roomId.toUpperCase(),
       peerIds: result.peerIds,
     });
 
-    // Tell the existing peer(s) that someone new has joined, so they can
-    // start the WebRTC offer/answer exchange.
     result.peerIds.forEach((peerId) => {
       io.to(peerId).emit('peer-joined', { peerId: socket.id });
     });
@@ -74,9 +68,6 @@ export function registerSignalingHandlers(io, socket) {
   });
 
   // --- Relay WebRTC signaling data ---------------------------------------
-  // `data` is opaque to the server — its shape is defined by the WebRTC
-  // API (RTCSessionDescriptionInit for offers/answers, RTCIceCandidateInit
-  // for ICE candidates). The server just forwards it to the named peer.
   socket.on('signal', (payload) => {
     const { to, data } = payload || {};
 

@@ -1,7 +1,7 @@
 {
   "name": "easyshare-server",
   "version": "1.0.0",
-  "description": "Lightweight signaling server for P2P Web Share — coordinates WebRTC handshakes only, never touches file data.",
+  "description": "Lightweight signaling server for EasyShare — coordinates WebRTC handshakes only, never touches file data.",
   "main": "index.js",
   "type": "module",
   "scripts": {

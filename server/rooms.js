@@ -34,8 +34,6 @@ const socketRoomMap = new Map();
  */
 export function createRoom(socketId) {
   let roomId = generateRoomId();
-  // Collisions are extremely unlikely at this alphabet/length, but guard
-  // anyway since room IDs must be unique.
   while (rooms.has(roomId)) {
     roomId = generateRoomId();
   }
