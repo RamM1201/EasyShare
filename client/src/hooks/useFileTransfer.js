@@ -1,52 +1,17 @@
-/**
- * useFileTransfer — manages file chunking, sending, and receiving over the
- * WebRTC data channel established by useWebRTC.
- *
- * Stage 5 scope:
- *   - Sender: reads File in 16 KB chunks using Blob.slice() + arrayBuffer(),
- *     sends a JSON metadata message first, then sends raw ArrayBuffer chunks.
- *     Implements backpressure: pauses when bufferedAmount exceeds threshold
- *     and resumes on 'bufferedamountlow'.
- *   - Receiver: listens for onmessage events, distinguishes the metadata
- *     message (JSON string) from chunk data (ArrayBuffer), accumulates
- *     chunks in order with byte-count tracking.
- *
- * Stage 6 will add SHA-256 hashing per chunk and for the whole file.
- * Stage 7 will reassemble the chunk array into a Blob and trigger download.
- * Stage 8 will add progress UI and speed calculations (chunksReceived /
- * totalChunks and bytesReceived / totalBytes are already surfaced here).
- *
- * Metadata message format (sent as JSON string before any chunk):
- *   {
- *     type: 'metadata',
- *     name: string,      // file name
- *     size: number,      // total bytes
- *     mimeType: string,  // MIME type (may be '')
- *     totalChunks: number,
- *     chunkSize: number, // nominal chunk size in bytes (last chunk may be smaller)
- *   }
- *
- * Data messages: raw ArrayBuffer (one per chunk, in order).
- *
- * Usage:
- *   const { status, progress, chunksReceived, totalChunks, error } =
- *     useFileTransfer({ dataChannel, role, file });
- *
- *   `status` — 'idle' | 'transferring' | 'done' | 'error'
- *   `progress` — 0–100 (number)
- *   `bytesTransferred` — bytes sent or received so far
- *   `totalBytes` — total file size
- *   `chunksReceived` / `totalChunks` — useful for Stage 8 speed display
- *   `receivedMetadata` — the parsed metadata object (receiver side only, null until received)
- *   `receivedChunks` — accumulated ArrayBuffer array (receiver side; handed to Stage 7)
- *   `error` — human-readable error string or null
- */
+// client/src/hooks/useFileTransfer.js
+// Stage 6: Added SHA-256 chunk hashing (sender) and verification (receiver)
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 
-// 16 KB chunks — well below the 64 KB bufferedAmountLowThreshold set in
-// useWebRTC, leaving plenty of headroom before backpressure kicks in.
 export const CHUNK_SIZE = 16 * 1024; // 16 KB
+
+// Helper: compute SHA-256 of an ArrayBuffer, return hex string
+async function sha256Hex(buffer) {
+  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
 
 export function useFileTransfer({ dataChannel, role, file }) {
   const [status, setStatus] = useState('idle');
@@ -56,213 +21,194 @@ export function useFileTransfer({ dataChannel, role, file }) {
   const [chunksReceived, setChunksReceived] = useState(0);
   const [totalChunks, setTotalChunks] = useState(0);
   const [receivedMetadata, setReceivedMetadata] = useState(null);
+  const [receivedChunks, setReceivedChunks] = useState(null);
   const [error, setError] = useState(null);
 
-  // Mutable accumulator for received chunks — not stored in state to avoid
-  // re-renders on every chunk; handed to Stage 7 when status === 'done'.
   const receivedChunksRef = useRef([]);
-  // Keep a stable ref to receivedChunks so Stage 7 can read it after done.
-  const [receivedChunksSnapshot, setReceivedChunksSnapshot] = useState(null);
+  const metadataRef = useRef(null);
+  const bytesRef = useRef(0);
+  const pausedRef = useRef(false);
+  const resumeRef = useRef(null);
 
-  // Sender-side: track current chunk index and whether we're paused for
-  // backpressure.
-  const senderStateRef = useRef({
-    chunkIndex: 0,
-    totalChunks: 0,
-    file: null,
-    paused: false,
-    cancelled: false,
-  });
-
-  // ── Sender: send next chunk (called repeatedly until done) ────────────
-  const sendNextChunk = useCallback(async (dc, f, state) => {
-    if (state.cancelled) return;
-
-    const { chunkIndex, totalChunks: total } = state;
-
-    if (chunkIndex >= total) {
-      // All chunks sent.
-      setStatus('done');
-      setProgress(100);
-      return;
-    }
-
-    // Check backpressure before sending.
-    if (dc.bufferedAmount > dc.bufferedAmountLowThreshold) {
-      // Wait for bufferedamountlow event — handler will call sendNextChunk.
-      state.paused = true;
-      return;
-    }
-
-    const start = chunkIndex * CHUNK_SIZE;
-    const end = Math.min(start + CHUNK_SIZE, f.size);
-    const slice = f.slice(start, end);
-    const buffer = await slice.arrayBuffer();
-
-    if (state.cancelled) return;
+  // ─── SENDER ────────────────────────────────────────────────────────────────
+  const runSender = useCallback(async () => {
+    if (!file || !dataChannel || dataChannel.readyState !== 'open') return;
 
     try {
-      dc.send(buffer);
-    } catch (err) {
-      console.error('[fileTransfer] send error', err);
-      setError('Send failed: ' + err.message);
-      setStatus('error');
-      return;
-    }
+      setStatus('transferring');
+      setTotalBytes(file.size);
 
-    state.chunkIndex += 1;
-    const bytesSent = Math.min(state.chunkIndex * CHUNK_SIZE, f.size);
-    setBytesTransferred(bytesSent);
-    setProgress(Math.round((state.chunkIndex / total) * 100));
+      const totalChunkCount = Math.ceil(file.size / CHUNK_SIZE);
+      setTotalChunks(totalChunkCount);
 
-    // Yield to the event loop between chunks so the UI can breathe and so
-    // the backpressure check above has a chance to fire.
-    setTimeout(() => sendNextChunk(dc, f, state), 0);
-  }, []);
+      // --- Stage 6: compute full-file hash BEFORE chunking ---
+      console.log('[fileTransfer] computing full-file hash…');
+      const fullBuffer = await file.arrayBuffer();
+      const fileHash = await sha256Hex(fullBuffer);
 
-  // ── Effect: kick off transfer or set up receiver when channel opens ───
-  useEffect(() => {
-    if (!dataChannel || dataChannel.readyState !== 'open') return;
-    if (role !== 'sender' && role !== 'receiver') return;
-
-    let cancelled = false;
-
-    if (role === 'sender') {
-      if (!file) {
-        setError('No file to send.');
-        setStatus('error');
-        return;
+      // --- Stage 6: compute per-chunk hashes ---
+      console.log('[fileTransfer] computing per-chunk hashes…');
+      const chunkHashes = [];
+      for (let i = 0; i < totalChunkCount; i++) {
+        const start = i * CHUNK_SIZE;
+        const chunk = file.slice(start, start + CHUNK_SIZE);
+        const buf = await chunk.arrayBuffer();
+        chunkHashes.push(await sha256Hex(buf));
       }
 
-      const totalChunksCount = Math.ceil(file.size / CHUNK_SIZE);
-
-      // Send metadata first.
+      // --- Send metadata (Stage 6 format) ---
       const metadata = {
         type: 'metadata',
         name: file.name,
         size: file.size,
-        mimeType: file.type || '',
-        totalChunks: totalChunksCount,
+        mimeType: file.type || 'application/octet-stream',
+        totalChunks: totalChunkCount,
         chunkSize: CHUNK_SIZE,
+        chunkHashes,   // Stage 6
+        fileHash,      // Stage 6
       };
+      dataChannel.send(JSON.stringify(metadata));
+      console.log('[fileTransfer] metadata sent (with hashes)');
 
-      try {
-        dataChannel.send(JSON.stringify(metadata));
-      } catch (err) {
-        setError('Failed to send metadata: ' + err.message);
-        setStatus('error');
+      // --- Backpressure helper ---
+      const waitForDrain = () =>
+        new Promise(resolve => {
+          resumeRef.current = resolve;
+          pausedRef.current = true;
+        });
+
+      const onBufferedAmountLow = () => {
+        if (pausedRef.current && resumeRef.current) {
+          pausedRef.current = false;
+          const resolve = resumeRef.current;
+          resumeRef.current = null;
+          resolve();
+        }
+      };
+      dataChannel.addEventListener('bufferedamountlow', onBufferedAmountLow);
+
+      // --- Chunk sending loop ---
+      let bytesSent = 0;
+      for (let i = 0; i < totalChunkCount; i++) {
+        const start = i * CHUNK_SIZE;
+        const buf = await file.slice(start, start + CHUNK_SIZE).arrayBuffer();
+
+        if (dataChannel.bufferedAmount > dataChannel.bufferedAmountLowThreshold) {
+          await waitForDrain();
+        }
+
+        dataChannel.send(buf);
+        bytesSent += buf.byteLength;
+        setBytesTransferred(bytesSent);
+        setProgress(Math.round((bytesSent / file.size) * 100));
+
+        await new Promise(r => setTimeout(r, 0));
+      }
+
+      dataChannel.removeEventListener('bufferedamountlow', onBufferedAmountLow);
+      setStatus('done');
+      setProgress(100);
+      console.log('[fileTransfer] all chunks sent');
+    } catch (err) {
+      console.error('[fileTransfer] sender error', err);
+      setError(err.message || 'Send error');
+      setStatus('error');
+    }
+  }, [dataChannel, file]);
+
+  // ─── RECEIVER ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!dataChannel || role !== 'receiver') return;
+
+    let chunkIndex = 0;
+
+    const onMessage = async (event) => {
+      // First message: metadata
+      if (metadataRef.current === null) {
+        const meta = JSON.parse(event.data);
+        metadataRef.current = meta;
+        setReceivedMetadata(meta);
+        setTotalBytes(meta.size);
+        setTotalChunks(meta.totalChunks);
+        receivedChunksRef.current = [];
+        bytesRef.current = 0;
+        chunkIndex = 0;
+        setStatus('transferring');
+        console.log('[fileTransfer] metadata received', meta);
         return;
       }
 
-      // Initialise sender state.
-      const state = senderStateRef.current;
-      state.chunkIndex = 0;
-      state.totalChunks = totalChunksCount;
-      state.file = file;
-      state.paused = false;
-      state.cancelled = false;
+      // Subsequent messages: chunk ArrayBuffers
+      const meta = metadataRef.current;
+      const buf = event.data; // ArrayBuffer
 
-      setTotalBytes(file.size);
-      setTotalChunks(totalChunksCount);
-      setStatus('transferring');
-
-      // Backpressure: resume sending when buffer drains.
-      function onBufferedAmountLow() {
-        if (state.cancelled) return;
-        if (state.paused) {
-          state.paused = false;
-          sendNextChunk(dataChannel, file, state);
-        }
-      }
-      dataChannel.addEventListener('bufferedamountlow', onBufferedAmountLow);
-
-      // Start sending.
-      sendNextChunk(dataChannel, file, state);
-
-      return () => {
-        cancelled = true;
-        state.cancelled = true;
-        dataChannel.removeEventListener('bufferedamountlow', onBufferedAmountLow);
-      };
-    }
-
-    if (role === 'receiver') {
-      // Reset accumulator for a fresh transfer.
-      receivedChunksRef.current = [];
-      let metadataReceived = false;
-      let expectedTotal = 0;
-      let bytesRx = 0;
-
-      function onMessage(event) {
-        if (cancelled) return;
-
-        // First message is always the JSON metadata string.
-        if (!metadataReceived) {
-          try {
-            const meta = JSON.parse(event.data);
-            if (meta.type !== 'metadata') {
-              throw new Error('Expected metadata message first');
-            }
-            metadataReceived = true;
-            expectedTotal = meta.totalChunks;
-            setReceivedMetadata(meta);
-            setTotalBytes(meta.size);
-            setTotalChunks(meta.totalChunks);
-            setStatus('transferring');
-            console.log('[fileTransfer] metadata received', meta);
-          } catch (err) {
-            console.error('[fileTransfer] bad metadata', err);
-            setError('Received invalid metadata from sender.');
-            setStatus('error');
-          }
+      // --- Stage 6: verify chunk hash ---
+      if (meta.chunkHashes) {
+        const receivedHash = await sha256Hex(buf);
+        const expectedHash = meta.chunkHashes[chunkIndex];
+        if (receivedHash !== expectedHash) {
+          const msg = `Chunk ${chunkIndex} hash mismatch — data corrupted`;
+          console.error('[fileTransfer]', msg);
+          setError(msg);
+          setStatus('error');
           return;
         }
-
-        // Subsequent messages are ArrayBuffer chunks.
-        const chunk =
-          event.data instanceof ArrayBuffer
-            ? event.data
-            : event.data; // already ArrayBuffer in Chrome/Firefox
-
-        receivedChunksRef.current.push(chunk);
-        const received = receivedChunksRef.current.length;
-
-        // Update byte count using the chunk's actual byte length.
-        if (chunk && chunk.byteLength != null) {
-          bytesRx += chunk.byteLength;
-        }
-
-        setBytesTransferred(bytesRx);
-        setChunksReceived(received);
-        setProgress(Math.round((received / expectedTotal) * 100));
-
-        if (received >= expectedTotal) {
-          // Snapshot the array so Stage 7 can read it from state.
-          setReceivedChunksSnapshot([...receivedChunksRef.current]);
-          setStatus('done');
-          setProgress(100);
-          console.log('[fileTransfer] all chunks received', received);
-        }
       }
 
-      dataChannel.addEventListener('message', onMessage);
+      receivedChunksRef.current.push(buf);
+      bytesRef.current += buf.byteLength;
+      chunkIndex++;
 
-      return () => {
-        cancelled = true;
-        dataChannel.removeEventListener('message', onMessage);
-      };
+      setBytesTransferred(bytesRef.current);
+      setChunksReceived(receivedChunksRef.current.length);
+      setProgress(Math.round((bytesRef.current / meta.size) * 100));
+
+      if (receivedChunksRef.current.length >= meta.totalChunks) {
+        console.log('[fileTransfer] all chunks received, verifying full-file hash…');
+        setStatus('verifying'); // Stage 6: intermediate UI state
+
+        // --- Stage 6: verify full-file hash ---
+        if (meta.fileHash) {
+          const blob = new Blob(receivedChunksRef.current, { type: meta.mimeType });
+          const fullBuf = await blob.arrayBuffer();
+          const computedHash = await sha256Hex(fullBuf);
+
+          if (computedHash !== meta.fileHash) {
+            const msg = 'Full-file hash mismatch — transfer corrupted';
+            console.error('[fileTransfer]', msg);
+            setError(msg);
+            setStatus('error');
+            return;
+          }
+          console.log('[fileTransfer] full-file hash verified ✓');
+        }
+
+        setReceivedChunks([...receivedChunksRef.current]);
+        setStatus('done');
+        setProgress(100);
+      }
+    };
+
+    dataChannel.addEventListener('message', onMessage);
+    return () => dataChannel.removeEventListener('message', onMessage);
+  }, [dataChannel, role]);
+
+  // ─── SENDER trigger ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (role === 'sender' && dataChannel && dataChannel.readyState === 'open') {
+      runSender();
     }
-  }, [dataChannel, role, file, sendNextChunk]);
+  }, [role, dataChannel, runSender]);
 
   return {
-    status,
+    status,       // 'idle' | 'transferring' | 'verifying' | 'done' | 'error'
     progress,
     bytesTransferred,
     totalBytes,
     chunksReceived,
     totalChunks,
     receivedMetadata,
-    receivedChunks: receivedChunksSnapshot,
+    receivedChunks,
     error,
   };
 }

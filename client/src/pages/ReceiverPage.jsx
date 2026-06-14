@@ -1,103 +1,138 @@
-/**
- * ReceiverPage — the /r/:roomId view.
- *
- * This component serves a dual role depending on the React Router `state`
- * passed when navigating here:
- *
- *  • Sender lands here (state.role === 'sender') after a peer joins.
- *    Stage 4 reads state.file and state.peerId to start the WebRTC offer.
- *
- *  • Receiver lands here directly via the share link (no router state).
- *    We emit 'join-room' immediately on mount, then handle the responses.
- *
- * Stage 3 responsibilities (done): join-room signaling, graceful disconnect.
- * Stage 4 responsibilities (done): WebRTC peer connection + data channel.
- * Stage 5 responsibilities (this file):
- *   - Mount useFileTransfer once dataChannel is open.
- *   - Sender: pass file to hook; show sending progress UI.
- *   - Receiver: show receiving progress UI based on hook state.
- *   - Both: surface status/progress/error from the hook in the UI.
- *
- * Stage 6 will add SHA-256 hash verification per chunk.
- * Stage 7 will add reassembly + auto-download from receivedChunks.
- */
+// client/src/pages/ReceiverPage.jsx
+// Stage 7: Blob reassembly + auto-download on transfer completion
 
 import { useEffect, useRef, useState } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { useParams, useLocation } from 'react-router-dom';
 import { useSignalingSocket } from '../hooks/useSignalingSocket';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { useFileTransfer } from '../hooks/useFileTransfer';
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(n) / Math.log(k));
+  return `${(n / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}
+
+// ── TransferProgress ──────────────────────────────────────────────────────────
+function TransferProgress({ status, progress, bytesTransferred, totalBytes, chunksReceived, totalChunks, error }) {
+  if (status === 'error') {
+    return (
+      <div className="mt-4 p-4 bg-red-50 border border-red-300 rounded-lg text-red-700">
+        <p className="font-semibold">❌ Integrity check failed</p>
+        <p className="text-sm mt-1">{error}</p>
+      </div>
+    );
+  }
+
+  if (status === 'verifying') {
+    return (
+      <div className="mt-4 p-4 bg-yellow-50 border border-yellow-300 rounded-lg">
+        <div className="flex items-center gap-2 text-yellow-700">
+          <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+          </svg>
+          <span className="font-medium">Verifying file integrity…</span>
+        </div>
+        <p className="text-xs text-yellow-600 mt-1">Computing SHA-256 hash of received file</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mt-4">
+      <div className="flex justify-between text-sm text-gray-600 mb-1">
+        <span>{status === 'done' ? 'Complete' : 'Transferring…'}</span>
+        <span>{progress}%</span>
+      </div>
+      <div className="w-full bg-gray-200 rounded-full h-2.5">
+        <div
+          className={`h-2.5 rounded-full transition-all duration-200 ${status === 'done' ? 'bg-green-500' : 'bg-blue-500'}`}
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+      <div className="flex justify-between text-xs text-gray-500 mt-1">
+        <span>{fmtBytes(bytesTransferred)} / {fmtBytes(totalBytes)}</span>
+        {chunksReceived > 0 && <span>Chunks: {chunksReceived} / {totalChunks}</span>}
+      </div>
+    </div>
+  );
+}
+
+// ── ReceiverPage ──────────────────────────────────────────────────────────────
 export default function ReceiverPage() {
   const { roomId } = useParams();
   const location = useLocation();
-  const navigate = useNavigate();
-  const socketRef = useSignalingSocket();
+  const isSender = location.state?.role === 'sender';
+  const fileFromState = location.state?.file ?? null;
+  const peerIdFromState = location.state?.peerId ?? null;
 
-  const routerState = location.state || {};
-  const isSender = routerState.role === 'sender';
+  const socket = useSignalingSocket();
+  const [connectionStatus, setConnectionStatus] = useState('connecting');
+  const [peerSocketId, setPeerSocketId] = useState(peerIdFromState);
+  const [signalingError, setSignalingError] = useState(null);
 
-  const [phase, setPhase] = useState(isSender ? 'connected' : 'joining');
-  const [errorMsg, setErrorMsg] = useState('');
+  const role = isSender ? 'sender' : 'receiver';
+  const fileRef = useRef(fileFromState);
 
-  const fileRef = useRef(routerState.file ?? null);
-  const peerIdRef = useRef(routerState.peerId ?? null);
-  const [peerId, setPeerId] = useState(routerState.peerId ?? null);
+  // Stage 7: guards auto-download against StrictMode double-invoke
+  const downloadedRef = useRef(false);
+  // Stage 7: persistent Blob URL for "Download again" button
+  const [downloadUrl, setDownloadUrl] = useState(null);
+  const [downloadName, setDownloadName] = useState('');
 
-  // ─── Socket listeners ──────────────────────────────────────────────
+  // ── Signaling ─────────────────────────────────────────────────────────────
   useEffect(() => {
-    const socket = socketRef.current;
     if (!socket) return;
 
     if (!isSender) {
       socket.emit('join-room', { roomId });
-
-      function onRoomJoined({ peerIds }) {
-        const senderId = peerIds[0] ?? null;
-        peerIdRef.current = senderId;
-        setPeerId(senderId);
-        setPhase('connected');
-      }
-
-      function onSignalingError({ message }) {
-        setErrorMsg(message);
-        setPhase('error');
-      }
-
-      socket.on('room-joined', onRoomJoined);
-      socket.on('signaling-error', onSignalingError);
-
-      return () => {
-        socket.off('room-joined', onRoomJoined);
-        socket.off('signaling-error', onSignalingError);
-      };
     }
-  }, [socketRef, isSender, roomId]);
+
+    const onRoomJoined = ({ peerIds }) => {
+      setPeerSocketId(peerIds[0]);
+      setConnectionStatus('waiting');
+    };
+    const onPeerJoined = ({ peerId }) => setPeerSocketId(peerId);
+    const onPeerLeft = () => setConnectionStatus('disconnected');
+    const onSignalingError = ({ message }) => {
+      setSignalingError(message);
+      setConnectionStatus('error');
+    };
+
+    socket.on('room-joined', onRoomJoined);
+    socket.on('peer-joined', onPeerJoined);
+    socket.on('peer-left', onPeerLeft);
+    socket.on('signaling-error', onSignalingError);
+
+    return () => {
+      socket.off('room-joined', onRoomJoined);
+      socket.off('peer-joined', onPeerJoined);
+      socket.off('peer-left', onPeerLeft);
+      socket.off('signaling-error', onSignalingError);
+    };
+  }, [socket, isSender, roomId]);
+
+  // ── WebRTC ────────────────────────────────────────────────────────────────
+  const { dataChannel, connectionState } = useWebRTC({
+    socket,
+    role,
+    peerId: peerSocketId,
+  });
 
   useEffect(() => {
-    const socket = socketRef.current;
-    if (!socket) return;
-
-    function onPeerLeft() {
-      setPhase('peer-left');
-      setPeerId(null);
+    if (connectionState === 'connected') setConnectionStatus('connected');
+    else if (connectionState === 'failed' || connectionState === 'disconnected') {
+      setConnectionStatus('disconnected');
     }
+  }, [connectionState]);
 
-    socket.on('peer-left', onPeerLeft);
-    return () => socket.off('peer-left', onPeerLeft);
-  }, [socketRef]);
-
-  // ─── Stage 4: WebRTC peer connection ───────────────────────────────
-  const role = isSender ? 'sender' : 'receiver';
-  const webrtcPeerId = phase === 'connected' ? peerId : null;
-  const { dataChannel, connectionState, iceConnectionState, error: webrtcError } =
-    useWebRTC({ socketRef, role, peerId: webrtcPeerId });
-
-  // ─── Stage 5: File transfer ────────────────────────────────────────
-  // Only activate once the data channel is open.
-  const transferFile = isSender ? fileRef.current : null;
+  // ── File transfer ─────────────────────────────────────────────────────────
   const {
-    status: transferStatus,
+    status,
     progress,
     bytesTransferred,
     totalBytes,
@@ -105,437 +140,132 @@ export default function ReceiverPage() {
     totalChunks,
     receivedMetadata,
     receivedChunks,
-    error: transferError,
+    error,
   } = useFileTransfer({
-    dataChannel: dataChannel, // null until open; hook handles this
+    dataChannel,
     role,
-    file: transferFile,
+    file: fileRef.current,
   });
 
-  // ─── Render helpers ───────────────────────────────────────────────
-  function handleGoHome() {
-    navigate('/');
-  }
+  // ── Stage 7: Auto-download ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (isSender) return;
+    if (status !== 'done') return;
+    if (!receivedChunks || !receivedMetadata) return;
+    if (downloadedRef.current) return;
+    downloadedRef.current = true;
 
-  // ─── Phase: joining ───────────────────────────────────────────────
-  if (phase === 'joining') {
-    return (
-      <CenteredLayout>
-        <StatusCard
-          icon={<SpinnerIcon />}
-          title="Connecting…"
-          body={
-            <>
-              Joining room{' '}
-              <span className="font-mono text-slate-300 tracking-widest">
-                {roomId}
-              </span>
-            </>
-          }
-        />
-      </CenteredLayout>
-    );
-  }
+    const blob = new Blob(receivedChunks, {
+      type: receivedMetadata.mimeType || 'application/octet-stream',
+    });
+    const fileName = receivedMetadata.name;
 
-  // ─── Phase: error ─────────────────────────────────────────────────
-  if (phase === 'error') {
-    return (
-      <CenteredLayout>
-        <StatusCard
-          icon={<ErrorIcon />}
-          title="Couldn't join"
-          body={errorMsg || 'Something went wrong. Check the link and try again.'}
-          action={
-            <button
-              type="button"
-              onClick={handleGoHome}
-              className="w-full rounded-lg bg-link text-slate-950 py-2.5 px-6 text-sm font-semibold hover:bg-cyan-300 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-link"
-            >
-              Send a file instead
-            </button>
-          }
-        />
-      </CenteredLayout>
-    );
-  }
+    // Persistent URL — kept alive for "Download again"; revoked on unmount
+    const url = URL.createObjectURL(blob);
+    setDownloadUrl(url);
+    setDownloadName(fileName);
 
-  // ─── Phase: peer-left ─────────────────────────────────────────────
-  if (phase === 'peer-left') {
-    return (
-      <CenteredLayout>
-        <StatusCard
-          icon={<DisconnectIcon />}
-          title="Connection lost"
-          body="The other user disconnected. The transfer cannot continue."
-          action={
-            <button
-              type="button"
-              onClick={handleGoHome}
-              className="w-full rounded-lg bg-link text-slate-950 py-2.5 px-6 text-sm font-semibold hover:bg-cyan-300 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-link"
-            >
-              Start a new transfer
-            </button>
-          }
-        />
-      </CenteredLayout>
-    );
-  }
+    // Trigger auto-download
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
 
-  // ─── Phase: connected ─────────────────────────────────────────────
-  const isTransferring = transferStatus === 'transferring';
-  const isDone = transferStatus === 'done';
-  const hasTransferError = !!transferError || !!(webrtcError && connectionState === 'failed');
+    console.log('[ReceiverPage] auto-download triggered:', fileName);
+  }, [status, receivedChunks, receivedMetadata, isSender]);
+
+  // Revoke Blob URL on unmount
+  useEffect(() => {
+    return () => {
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+    };
+  }, [downloadUrl]);
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  const statusLabel = {
+    connecting: '🔄 Connecting to signaling server…',
+    waiting: '⏳ Waiting for peer to connect…',
+    connected: '🟢 Peer connected',
+    disconnected: '🔴 Peer disconnected',
+    error: `⚠️ ${signalingError || 'Connection error'}`,
+  }[connectionStatus] ?? '…';
 
   return (
-    <CenteredLayout>
-      <div className="w-full max-w-lg space-y-8">
-        {/* Header */}
-        <div className="text-center space-y-2">
-          <h1 className="text-4xl font-bold tracking-tight text-white">
-            Easy<span className="text-link">Share</span>
-          </h1>
-          <p className="text-slate-400 text-sm">
-            {isDone
-              ? isSender
-                ? 'File sent successfully.'
-                : 'File received successfully.'
-              : isSender
-              ? isTransferring
-                ? 'Sending file…'
-                : 'Receiver connected. Ready to transfer.'
-              : isTransferring
-              ? 'Receiving file…'
-              : 'Connected to sender. Waiting for transfer to begin…'}
-          </p>
-        </div>
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-6">
+      <div className="bg-white rounded-2xl shadow-lg p-8 w-full max-w-md">
+        <h1 className="text-2xl font-bold text-gray-800 mb-2">
+          {isSender ? '📤 Sending File' : '📥 Receiving File'}
+        </h1>
+        <p className="text-sm text-gray-500 mb-6">
+          Room: <span className="font-mono font-semibold">{roomId}</span>
+        </p>
 
-        {/* Main card */}
-        <div className="rounded-xl border border-slate-700 bg-slate-900 p-5 space-y-4">
+        <p className="text-sm text-gray-600 mb-4">{statusLabel}</p>
 
-          {/* Peers connected indicator */}
-          <div className="flex items-center gap-2">
-            <span className="relative flex h-2.5 w-2.5">
-              <span className={`absolute inline-flex h-full w-full rounded-full opacity-60 ${isDone ? 'bg-emerald-400' : 'animate-ping bg-emerald-400'}`} />
-              <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${isDone ? 'bg-emerald-400' : 'bg-emerald-400'}`} />
-            </span>
-            <span className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-              {isDone ? 'Transfer complete' : 'Peers connected'}
-            </span>
+        {/* File info — sender */}
+        {isSender && fileRef.current && (
+          <div className="bg-gray-50 rounded-lg p-3 mb-4 text-sm text-gray-700">
+            <p className="font-medium truncate">{fileRef.current.name}</p>
+            <p className="text-gray-500">{fmtBytes(fileRef.current.size)}</p>
           </div>
+        )}
 
-          {/* Room ID */}
-          <div className="rounded-lg bg-slate-800/60 px-4 py-3 space-y-1">
-            <p className="text-slate-500 text-xs">Room</p>
-            <p className="font-mono text-slate-200 tracking-widest text-sm">
-              {roomId}
-            </p>
+        {/* File info — receiver (from metadata) */}
+        {!isSender && receivedMetadata && (
+          <div className="bg-gray-50 rounded-lg p-3 mb-4 text-sm text-gray-700">
+            <p className="font-medium truncate">{receivedMetadata.name}</p>
+            <p className="text-gray-500">{fmtBytes(receivedMetadata.size)}</p>
           </div>
+        )}
 
-          {/* File info — sender shows their file, receiver shows metadata once received */}
-          {isSender && fileRef.current && (
-            <FileInfoRow
-              name={fileRef.current.name}
-              size={fileRef.current.size}
-            />
-          )}
-          {!isSender && receivedMetadata && (
-            <FileInfoRow
-              name={receivedMetadata.name}
-              size={receivedMetadata.size}
-            />
-          )}
-
-          {/* ── Stage 5: Transfer progress ─────────────────────────── */}
-          {(isTransferring || isDone || hasTransferError) && (
-            <TransferProgress
-              isSender={isSender}
-              status={transferStatus}
-              progress={progress}
-              bytesTransferred={bytesTransferred}
-              totalBytes={totalBytes}
-              chunksReceived={chunksReceived}
-              totalChunks={totalChunks}
-              error={transferError || webrtcError}
-            />
-          )}
-
-          {/* Stage 5 complete notice for receiver (Stage 7 will trigger download) */}
-          {!isSender && isDone && receivedChunks && (
-            <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 px-4 py-3">
-              <p className="text-emerald-400 text-xs font-medium">
-                ✓ All {totalChunks} chunks received —{' '}
-                {receivedMetadata?.name ?? 'file'} ready for reassembly (Stage 7).
-              </p>
-            </div>
-          )}
-
-          {/* WebRTC status badge (shown when not transferring / done) */}
-          {!isTransferring && !isDone && (
-            <WebRTCStatus
-              connectionState={connectionState}
-              iceConnectionState={iceConnectionState}
-              error={webrtcError}
-            />
-          )}
-        </div>
-
-        <button
-          type="button"
-          onClick={handleGoHome}
-          className="w-full rounded-lg py-2.5 px-6 text-sm text-slate-500 hover:text-slate-300 border border-slate-800 hover:border-slate-600 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-link"
-        >
-          {isDone ? 'Transfer another file' : 'Cancel transfer'}
-        </button>
-      </div>
-    </CenteredLayout>
-  );
-}
-
-// ─── Stage 5: Transfer progress component ─────────────────────────────────
-
-function TransferProgress({
-  isSender,
-  status,
-  progress,
-  bytesTransferred,
-  totalBytes,
-  chunksReceived,
-  totalChunks,
-  error,
-}) {
-  const isDone = status === 'done';
-  const isError = status === 'error' || !!error;
-
-  return (
-    <div className="space-y-3">
-      {/* Progress bar */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <span className="text-xs text-slate-400">
-            {isError
-              ? 'Transfer failed'
-              : isDone
-              ? isSender
-                ? 'Sent'
-                : 'Received'
-              : isSender
-              ? 'Sending'
-              : 'Receiving'}
-          </span>
-          <span className="text-xs font-mono text-slate-300">
-            {isError ? '—' : `${progress}%`}
-          </span>
-        </div>
-
-        <div className="h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
-          <div
-            className={`h-full rounded-full transition-all duration-200 ${
-              isError
-                ? 'bg-red-500'
-                : isDone
-                ? 'bg-emerald-400'
-                : 'bg-link'
-            }`}
-            style={{ width: `${isError ? 100 : progress}%` }}
+        {/* Progress / verifying / error */}
+        {['transferring', 'verifying', 'done', 'error'].includes(status) && (
+          <TransferProgress
+            status={status}
+            progress={progress}
+            bytesTransferred={bytesTransferred}
+            totalBytes={totalBytes}
+            chunksReceived={chunksReceived}
+            totalChunks={totalChunks}
+            error={error}
           />
-        </div>
-      </div>
+        )}
 
-      {/* Byte / chunk counters */}
-      {!isError && (
-        <div className="flex items-center justify-between text-xs text-slate-500 font-mono">
-          <span>
-            {formatBytes(bytesTransferred)} / {formatBytes(totalBytes)}
-          </span>
-          <span>
-            {isSender
-              ? `chunk ${Math.min(Math.ceil(bytesTransferred / (16 * 1024)), totalChunks)} / ${totalChunks}`
-              : `chunk ${chunksReceived} / ${totalChunks}`}
-          </span>
-        </div>
-      )}
+        {/* Completion */}
+        {status === 'done' && (
+          <div className="mt-4 p-4 bg-green-50 border border-green-300 rounded-lg text-green-700">
+            {isSender ? (
+              <p className="font-semibold">✅ File sent successfully</p>
+            ) : (
+              <>
+                <p className="font-semibold">✅ Transfer complete — ✓ Verified</p>
+                <p className="text-sm mt-1">
+                  {chunksReceived} chunks received &amp; SHA-256 verified.
+                  Your download has started automatically.
+                </p>
+                {downloadUrl && (
+                  <a
+                    href={downloadUrl}
+                    download={downloadName}
+                    className="mt-3 inline-block px-4 py-2 bg-green-600 text-white text-sm font-medium rounded-lg hover:bg-green-700 transition-colors"
+                  >
+                    ⬇️ Download again
+                  </a>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
-      {/* Error message */}
-      {isError && error && (
-        <p role="alert" className="text-red-400 text-xs">
-          {error}
-        </p>
-      )}
-    </div>
-  );
-}
-
-// ─── Shared sub-components ────────────────────────────────────────────────
-
-function FileInfoRow({ name, size }) {
-  return (
-    <div className="flex items-center gap-3 rounded-lg bg-slate-800/60 px-4 py-3">
-      <svg
-        className="w-4 h-4 text-slate-500 shrink-0"
-        fill="none"
-        viewBox="0 0 24 24"
-        stroke="currentColor"
-        strokeWidth={2}
-      >
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-        />
-      </svg>
-      <div className="min-w-0">
-        <p className="text-slate-300 text-xs font-medium truncate">{name}</p>
-        <p className="text-slate-500 text-xs">{formatBytes(size)}</p>
+        {/* Disconnected mid-transfer */}
+        {connectionStatus === 'disconnected' && status !== 'done' && (
+          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
+            The other peer disconnected.
+          </div>
+        )}
       </div>
     </div>
-  );
-}
-
-function WebRTCStatus({ connectionState, iceConnectionState, error }) {
-  const config = getStatusConfig(connectionState, error);
-
-  return (
-    <div className="rounded-lg border border-dashed border-slate-700 px-4 py-3 space-y-2">
-      <div className="flex items-center justify-between">
-        <span className="text-slate-500 text-xs uppercase tracking-wider">
-          P2P connection
-        </span>
-        <span
-          className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${config.badgeClass}`}
-        >
-          <span className={`w-1.5 h-1.5 rounded-full ${config.dotClass}`} />
-          {config.label}
-        </span>
-      </div>
-      <p className="text-slate-500 text-xs">
-        ICE state: <span className="font-mono">{iceConnectionState}</span>
-      </p>
-      {error && (
-        <p role="alert" className="text-red-400 text-xs">
-          {error}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function getStatusConfig(connectionState, error) {
-  if (error || connectionState === 'failed') {
-    return {
-      label: 'Failed',
-      badgeClass: 'bg-red-500/10 text-red-400',
-      dotClass: 'bg-red-400',
-    };
-  }
-  if (connectionState === 'connected') {
-    return {
-      label: 'Connected',
-      badgeClass: 'bg-emerald-500/10 text-emerald-400',
-      dotClass: 'bg-emerald-400',
-    };
-  }
-  if (connectionState === 'disconnected' || connectionState === 'closed') {
-    return {
-      label: 'Disconnected',
-      badgeClass: 'bg-slate-700/60 text-slate-400',
-      dotClass: 'bg-slate-400',
-    };
-  }
-  return {
-    label: 'Connecting…',
-    badgeClass: 'bg-amber-500/10 text-amber-400',
-    dotClass: 'bg-amber-400 animate-pulse',
-  };
-}
-
-// ─── Utilities ────────────────────────────────────────────────────────────
-
-function formatBytes(bytes) {
-  if (!bytes && bytes !== 0) return '—';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function CenteredLayout({ children }) {
-  return (
-    <div className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
-      {children}
-    </div>
-  );
-}
-
-function StatusCard({ icon, title, body, action }) {
-  return (
-    <div className="w-full max-w-sm space-y-6 text-center">
-      <div className="mx-auto w-14 h-14 rounded-2xl bg-slate-900 border border-slate-800 flex items-center justify-center">
-        {icon}
-      </div>
-      <div className="space-y-2">
-        <h2 className="text-xl font-semibold text-white">{title}</h2>
-        <p className="text-slate-400 text-sm leading-relaxed">{body}</p>
-      </div>
-      {action && <div>{action}</div>}
-    </div>
-  );
-}
-
-function SpinnerIcon() {
-  return (
-    <svg
-      className="w-6 h-6 text-link animate-spin"
-      fill="none"
-      viewBox="0 0 24 24"
-    >
-      <circle
-        className="opacity-25"
-        cx="12"
-        cy="12"
-        r="10"
-        stroke="currentColor"
-        strokeWidth="4"
-      />
-      <path
-        className="opacity-75"
-        fill="currentColor"
-        d="M4 12a8 8 0 018-8v4l3-3-3-3v4a8 8 0 00-8 8h4z"
-      />
-    </svg>
-  );
-}
-
-function ErrorIcon() {
-  return (
-    <svg
-      className="w-6 h-6 text-red-400"
-      fill="none"
-      viewBox="0 0 24 24"
-      stroke="currentColor"
-      strokeWidth={2}
-    >
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"
-      />
-    </svg>
-  );
-}
-
-function DisconnectIcon() {
-  return (
-    <svg
-      className="w-6 h-6 text-slate-400"
-      fill="none"
-      viewBox="0 0 24 24"
-      stroke="currentColor"
-      strokeWidth={2}
-    >
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
-      />
-    </svg>
   );
 }
