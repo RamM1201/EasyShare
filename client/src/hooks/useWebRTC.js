@@ -3,25 +3,15 @@
  * two peers in a room, using the signaling socket from
  * useSignalingSocket().
  *
- * Stage 4 scope:
- *   - Create RTCPeerConnection with public STUN servers.
- *   - Sender: create data channel 'file-transfer', create offer, send via
- *     `signal`.
- *   - Receiver: listen for `signal` offer, set remote description, create
- *     answer, send via `signal`; capture incoming data channel via
- *     `ondatachannel`.
- *   - Both: exchange ICE candidates via `signal`.
- *   - Surface connectionState / iceConnectionState for the UI.
- *   - Clean up (pc.close()) on unmount.
- *
- * Stage 5 will use the returned `dataChannel` to start sending/receiving
- * file data. Do NOT change the data channel label ('file-transfer') or
- * the bufferedAmountLowThreshold (64 KB) — both are part of the Stage 4/5
- * contract.
+ * Stage 8 additions:
+ *   - Listen for `peer-left` on the socket and close + null the
+ *     RTCPeerConnection immediately so no zombie connections linger.
+ *   - Expose `peerLeft` boolean so ReceiverPage can distinguish a
+ *     signaling-level disconnect from a WebRTC-level one.
  *
  * Usage:
- *   const { dataChannel, connectionState, iceConnectionState, error } =
- *     useWebRTC({ socketRef, role, peerId });
+ *   const { dataChannel, connectionState, iceConnectionState, error, peerLeft } =
+ *     useWebRTC({ socket, role, peerId });
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -34,21 +24,32 @@ const ICE_SERVERS = [
 const DATA_CHANNEL_LABEL = 'file-transfer';
 const BUFFERED_AMOUNT_LOW_THRESHOLD = 64 * 1024; // 64 KB — used by Stage 5
 
-export function useWebRTC({ socketRef, role, peerId }) {
+export function useWebRTC({ socket, role, peerId }) {
   const [connectionState, setConnectionState] = useState('new');
   const [iceConnectionState, setIceConnectionState] = useState('new');
   const [dataChannel, setDataChannel] = useState(null);
   const [error, setError] = useState(null);
+  // Stage 8: fires true when peer-left is received from signaling server
+  const [peerLeft, setPeerLeft] = useState(false);
 
   const pcRef = useRef(null);
   const dcRef = useRef(null);
-  // Buffer ICE candidates that arrive before remoteDescription is set.
   const pendingCandidatesRef = useRef([]);
 
-  useEffect(() => {
-    const socket = socketRef.current;
+  // Helper: tear down the RTCPeerConnection cleanly
+  const closePeerConnection = () => {
+    if (dcRef.current) {
+      try { dcRef.current.close(); } catch { /* ignore */ }
+      dcRef.current = null;
+    }
+    if (pcRef.current) {
+      try { pcRef.current.close(); } catch { /* ignore */ }
+      pcRef.current = null;
+    }
+    setDataChannel(null);
+  };
 
-    // Wait until we have everything we need to start.
+  useEffect(() => {
     if (!socket || !role || !peerId) return;
 
     let cancelled = false;
@@ -99,51 +100,41 @@ export function useWebRTC({ socketRef, role, peerId }) {
       }
     };
 
-    // ── Signal message handler (shared for both roles) ────────────────
+    // ── Signal message handler ────────────────────────────────────────
     async function onSignal({ from, data }) {
       if (!data || from !== peerId) return;
+      const currentPc = pcRef.current;
+      if (!currentPc) return;
 
       try {
         switch (data.type) {
           case 'offer': {
-            // Only the receiver should act on offers.
             if (role !== 'receiver') return;
-            await pc.setRemoteDescription(
-              new RTCSessionDescription(data.sdp)
-            );
+            await currentPc.setRemoteDescription(new RTCSessionDescription(data.sdp));
             await flushPendingCandidates();
-
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
-
+            const answer = await currentPc.createAnswer();
+            await currentPc.setLocalDescription(answer);
             socket.emit('signal', {
               to: peerId,
               data: { type: 'answer', sdp: answer },
             });
             break;
           }
-
           case 'answer': {
-            // Only the sender should act on answers.
             if (role !== 'sender') return;
-            await pc.setRemoteDescription(
-              new RTCSessionDescription(data.sdp)
-            );
+            await currentPc.setRemoteDescription(new RTCSessionDescription(data.sdp));
             await flushPendingCandidates();
             break;
           }
-
           case 'ice-candidate': {
             const candidate = new RTCIceCandidate(data.candidate);
-            if (pc.remoteDescription && pc.remoteDescription.type) {
-              await pc.addIceCandidate(candidate);
+            if (currentPc.remoteDescription && currentPc.remoteDescription.type) {
+              await currentPc.addIceCandidate(candidate);
             } else {
-              // Remote description not set yet — buffer for later.
               pendingCandidatesRef.current.push(candidate);
             }
             break;
           }
-
           default:
             break;
         }
@@ -158,18 +149,26 @@ export function useWebRTC({ socketRef, role, peerId }) {
       pendingCandidatesRef.current = [];
       for (const candidate of pending) {
         try {
-          await pc.addIceCandidate(candidate);
+          await pcRef.current?.addIceCandidate(candidate);
         } catch (err) {
           console.error('[webrtc] failed to add buffered ICE candidate', err);
         }
       }
     }
 
+    // ── Stage 8: peer-left handler ────────────────────────────────────
+    function onPeerLeft({ peerId: leftId }) {
+      if (leftId !== peerId) return;
+      console.log('[webrtc] peer-left received — closing RTCPeerConnection');
+      closePeerConnection();
+      if (!cancelled) setPeerLeft(true);
+    }
+
     socket.on('signal', onSignal);
+    socket.on('peer-left', onPeerLeft);
 
     // ── Role-specific kickoff ─────────────────────────────────────────
     if (role === 'sender') {
-      // Sender creates the data channel and the initial offer.
       const channel = pc.createDataChannel(DATA_CHANNEL_LABEL);
       wireDataChannel(channel);
 
@@ -187,7 +186,6 @@ export function useWebRTC({ socketRef, role, peerId }) {
         }
       })();
     } else if (role === 'receiver') {
-      // Receiver waits for the sender's data channel.
       pc.ondatachannel = (event) => {
         wireDataChannel(event.channel);
       };
@@ -197,29 +195,11 @@ export function useWebRTC({ socketRef, role, peerId }) {
     return () => {
       cancelled = true;
       socket.off('signal', onSignal);
-
-      if (dcRef.current) {
-        try {
-          dcRef.current.close();
-        } catch {
-          // ignore
-        }
-        dcRef.current = null;
-      }
-
-      if (pcRef.current) {
-        try {
-          pcRef.current.close();
-        } catch {
-          // ignore
-        }
-        pcRef.current = null;
-      }
-
-      setDataChannel(null);
+      socket.off('peer-left', onPeerLeft);
+      closePeerConnection();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [socketRef, role, peerId]);
+  }, [socket, role, peerId]);
 
-  return { dataChannel, connectionState, iceConnectionState, error };
+  return { dataChannel, connectionState, iceConnectionState, error, peerLeft };
 }

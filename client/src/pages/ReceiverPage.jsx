@@ -1,5 +1,5 @@
 // client/src/pages/ReceiverPage.jsx
-// Stage 7: Blob reassembly + auto-download on transfer completion
+// Stage 8: Transfer speed, connection badge, hardened disconnect handling
 
 import { useEffect, useRef, useState } from 'react';
 import { useParams, useLocation } from 'react-router-dom';
@@ -16,8 +16,38 @@ function fmtBytes(n) {
   return `${(n / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
+// Stage 8: format bytes/sec → "X.X MB/s" or "X KB/s"
+function fmtSpeed(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return '—';
+  if (bytesPerSec >= 1024 * 1024) {
+    return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+  }
+  return `${Math.round(bytesPerSec / 1024)} KB/s`;
+}
+
+// ── ConnectionBadge ───────────────────────────────────────────────────────────
+// Stage 8: persistent header badge reflecting connection state
+function ConnectionBadge({ connectionStatus }) {
+  const configs = {
+    connecting:    { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Connecting…' },
+    waiting:       { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Waiting for peer…' },
+    connected:     { dot: 'bg-green-400',                text: 'text-green-300',  label: 'Connected' },
+    disconnected:  { dot: 'bg-red-500',                  text: 'text-red-400',    label: 'Disconnected' },
+    interrupted:   { dot: 'bg-orange-500',               text: 'text-orange-400', label: 'Transfer interrupted' },
+    error:         { dot: 'bg-red-500',                  text: 'text-red-400',    label: 'Error' },
+  };
+  const cfg = configs[connectionStatus] ?? configs.connecting;
+
+  return (
+    <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-800 border border-slate-700 text-xs font-medium ${cfg.text}`}>
+      <span className={`w-2 h-2 rounded-full ${cfg.dot}`} />
+      {cfg.label}
+    </div>
+  );
+}
+
 // ── TransferProgress ──────────────────────────────────────────────────────────
-function TransferProgress({ status, progress, bytesTransferred, totalBytes, chunksReceived, totalChunks, error }) {
+function TransferProgress({ status, progress, bytesTransferred, totalBytes, chunksReceived, totalChunks, transferSpeed, error }) {
   if (status === 'error') {
     return (
       <div className="mt-4 p-4 bg-red-50 border border-red-300 rounded-lg text-red-700">
@@ -42,21 +72,38 @@ function TransferProgress({ status, progress, bytesTransferred, totalBytes, chun
     );
   }
 
+  const isDone = status === 'done';
+
   return (
     <div className="mt-4">
-      <div className="flex justify-between text-sm text-gray-600 mb-1">
-        <span>{status === 'done' ? 'Complete' : 'Transferring…'}</span>
-        <span>{progress}%</span>
+      {/* Stage 8: top row — label + percentage + speed */}
+      <div className="flex justify-between items-baseline text-sm text-gray-600 mb-1">
+        <span>{isDone ? 'Complete' : 'Transferring…'}</span>
+        <div className="flex items-baseline gap-3">
+          {/* Stage 8: speed display */}
+          {!isDone && (
+            <span className="text-xs text-gray-400 font-mono">
+              {fmtSpeed(transferSpeed)}
+            </span>
+          )}
+          <span className="font-semibold">{progress}%</span>
+        </div>
       </div>
+
+      {/* Progress bar */}
       <div className="w-full bg-gray-200 rounded-full h-2.5">
         <div
-          className={`h-2.5 rounded-full transition-all duration-200 ${status === 'done' ? 'bg-green-500' : 'bg-blue-500'}`}
+          className={`h-2.5 rounded-full transition-all duration-200 ${isDone ? 'bg-green-500' : 'bg-blue-500'}`}
           style={{ width: `${progress}%` }}
         />
       </div>
+
+      {/* Stage 8: bottom row — bytes + chunk count */}
       <div className="flex justify-between text-xs text-gray-500 mt-1">
         <span>{fmtBytes(bytesTransferred)} / {fmtBytes(totalBytes)}</span>
-        {chunksReceived > 0 && <span>Chunks: {chunksReceived} / {totalChunks}</span>}
+        {chunksReceived > 0 && (
+          <span>Chunks: {chunksReceived} / {totalChunks}</span>
+        )}
       </div>
     </div>
   );
@@ -70,7 +117,9 @@ export default function ReceiverPage() {
   const fileFromState = location.state?.file ?? null;
   const peerIdFromState = location.state?.peerId ?? null;
 
-  const socket = useSignalingSocket();
+  const socketRef = useSignalingSocket();
+  const socket = socketRef.current;
+
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [peerSocketId, setPeerSocketId] = useState(peerIdFromState);
   const [signalingError, setSignalingError] = useState(null);
@@ -80,7 +129,6 @@ export default function ReceiverPage() {
 
   // Stage 7: guards auto-download against StrictMode double-invoke
   const downloadedRef = useRef(false);
-  // Stage 7: persistent Blob URL for "Download again" button
   const [downloadUrl, setDownloadUrl] = useState(null);
   const [downloadName, setDownloadName] = useState('');
 
@@ -97,7 +145,13 @@ export default function ReceiverPage() {
       setConnectionStatus('waiting');
     };
     const onPeerJoined = ({ peerId }) => setPeerSocketId(peerId);
-    const onPeerLeft = () => setConnectionStatus('disconnected');
+    const onPeerLeft = () => {
+      // Stage 8: connection status update happens in the main component body
+      // based on transfer status — set to disconnected here as a fallback
+      setConnectionStatus(prev =>
+        prev === 'connected' ? 'disconnected' : prev
+      );
+    };
     const onSignalingError = ({ message }) => {
       setSignalingError(message);
       setConnectionStatus('error');
@@ -117,7 +171,9 @@ export default function ReceiverPage() {
   }, [socket, isSender, roomId]);
 
   // ── WebRTC ────────────────────────────────────────────────────────────────
-  const { dataChannel, connectionState } = useWebRTC({
+  // Stage 8: useWebRTC now accepts `socket` directly (not socketRef)
+  // and exposes `peerLeft`
+  const { dataChannel, connectionState, peerLeft } = useWebRTC({
     socket,
     role,
     peerId: peerSocketId,
@@ -141,11 +197,27 @@ export default function ReceiverPage() {
     receivedMetadata,
     receivedChunks,
     error,
+    transferSpeed,  // Stage 8
   } = useFileTransfer({
     dataChannel,
     role,
     file: fileRef.current,
   });
+
+  // ── Stage 8: handle peerLeft scenarios ────────────────────────────────────
+  useEffect(() => {
+    if (!peerLeft) return;
+
+    if (status === 'transferring') {
+      // Mid-transfer disconnect
+      setConnectionStatus('interrupted');
+    } else if (status === 'done') {
+      // Transfer already finished — don't disrupt the success screen
+    } else {
+      // Before transfer started
+      setConnectionStatus('disconnected');
+    }
+  }, [peerLeft, status]);
 
   // ── Stage 7: Auto-download ─────────────────────────────────────────────────
   useEffect(() => {
@@ -160,12 +232,10 @@ export default function ReceiverPage() {
     });
     const fileName = receivedMetadata.name;
 
-    // Persistent URL — kept alive for "Download again"; revoked on unmount
     const url = URL.createObjectURL(blob);
     setDownloadUrl(url);
     setDownloadName(fileName);
 
-    // Trigger auto-download
     const a = document.createElement('a');
     a.href = url;
     a.download = fileName;
@@ -184,25 +254,21 @@ export default function ReceiverPage() {
   }, [downloadUrl]);
 
   // ── Render ────────────────────────────────────────────────────────────────
-  const statusLabel = {
-    connecting: '🔄 Connecting to signaling server…',
-    waiting: '⏳ Waiting for peer to connect…',
-    connected: '🟢 Peer connected',
-    disconnected: '🔴 Peer disconnected',
-    error: `⚠️ ${signalingError || 'Connection error'}`,
-  }[connectionStatus] ?? '…';
-
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-6">
       <div className="bg-white rounded-2xl shadow-lg p-8 w-full max-w-md">
-        <h1 className="text-2xl font-bold text-gray-800 mb-2">
-          {isSender ? '📤 Sending File' : '📥 Receiving File'}
-        </h1>
+
+        {/* Stage 8: header with title + connection badge */}
+        <div className="flex items-start justify-between mb-2">
+          <h1 className="text-2xl font-bold text-gray-800">
+            {isSender ? '📤 Sending File' : '📥 Receiving File'}
+          </h1>
+          <ConnectionBadge connectionStatus={connectionStatus} />
+        </div>
+
         <p className="text-sm text-gray-500 mb-6">
           Room: <span className="font-mono font-semibold">{roomId}</span>
         </p>
-
-        <p className="text-sm text-gray-600 mb-4">{statusLabel}</p>
 
         {/* File info — sender */}
         {isSender && fileRef.current && (
@@ -229,6 +295,7 @@ export default function ReceiverPage() {
             totalBytes={totalBytes}
             chunksReceived={chunksReceived}
             totalChunks={totalChunks}
+            transferSpeed={transferSpeed}
             error={error}
           />
         )}
@@ -259,8 +326,29 @@ export default function ReceiverPage() {
           </div>
         )}
 
-        {/* Disconnected mid-transfer */}
-        {connectionStatus === 'disconnected' && status !== 'done' && (
+        {/* Stage 8: sender error from closed channel */}
+        {isSender && status === 'error' && (
+          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
+            ❌ {error || 'Transfer failed.'}
+          </div>
+        )}
+
+        {/* Stage 8: Disconnect scenarios — receiver side */}
+        {!isSender && connectionStatus === 'interrupted' && status !== 'done' && (
+          <div className="mt-4 p-3 bg-orange-50 border border-orange-200 rounded-lg text-orange-700 text-sm">
+            <p className="font-semibold">⚠️ Peer disconnected mid-transfer.</p>
+            <p className="mt-1">The file is incomplete and cannot be recovered.</p>
+          </div>
+        )}
+
+        {!isSender && connectionStatus === 'disconnected' && status === 'idle' && (
+          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
+            🔴 Peer disconnected before transfer started.
+          </div>
+        )}
+
+        {/* Generic disconnected fallback (not mid-transfer, not idle) */}
+        {connectionStatus === 'disconnected' && status !== 'done' && status !== 'idle' && connectionStatus !== 'interrupted' && (
           <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
             The other peer disconnected.
           </div>
