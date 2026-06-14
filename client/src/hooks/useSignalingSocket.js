@@ -19,10 +19,9 @@ const SIGNALING_SERVER_URL =
 // Module-level singleton so every call to useSignalingSocket() in the
 // same React tree shares exactly one socket connection.
 let _socket = null;
-let _refCount = 0;
 
 function getSocket() {
-  if (!_socket || _socket.disconnected) {
+  if (!_socket) {
     _socket = io(SIGNALING_SERVER_URL, {
       reconnection: true,
       reconnectionAttempts: 5,
@@ -36,17 +35,7 @@ export function useSignalingSocket() {
   const socketRef = useRef(null);
 
   useEffect(() => {
-    const socket = getSocket();
-    socketRef.current = socket;
-    _refCount += 1;
-
-    return () => {
-      _refCount -= 1;
-      if (_refCount === 0 && _socket) {
-        _socket.disconnect();
-        _socket = null;
-      }
-    };
+    socketRef.current = getSocket();
   }, []);
 
   return socketRef;

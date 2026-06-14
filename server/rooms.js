@@ -71,6 +71,13 @@ export function joinRoom(roomId, socketId) {
     return { ok: false, reason: 'not-found' };
   }
 
+  // Idempotent re-join (e.g. React StrictMode's dev double-effect) —
+  // don't treat an already-joined socket as "room full".
+  if (room.peers.has(socketId)) {
+    const otherPeerIds = Array.from(room.peers).filter((id) => id !== socketId);
+    return { ok: true, peerIds: otherPeerIds };
+  }
+  
   if (room.peers.size >= MAX_PEERS_PER_ROOM) {
     return { ok: false, reason: 'full' };
   }
