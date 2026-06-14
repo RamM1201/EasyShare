@@ -1,0 +1,23 @@
+{
+  "name": "easyshare-server",
+  "version": "1.0.0",
+  "description": "Lightweight signaling server for P2P Web Share — coordinates WebRTC handshakes only, never touches file data.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "nanoid": "^5.0.7",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
