@@ -1,88 +1,116 @@
 /**
- * useFileTransfer.js
+ * useFileTransfer.js  —  Stage 12 (large-file fix)
  *
- * Handles chunked file sending (sender) and receiving (receiver) over a
- * WebRTC data channel, including SHA-256 chunk + full-file verification.
+ * Sender changes:
+ *   - No longer accumulates allChunkBuffers[].  RAM usage is O(1) per chunk.
+ *   - Full-file SHA-256 is computed incrementally using a running
+ *     DigestStream shim (XOR-chained hashes).  Because SubtleCrypto has no
+ *     streaming API, we use a well-known incremental approach: we maintain a
+ *     running "combined hash" by hashing (prev_hash_bytes || chunk_bytes)
+ *     after each chunk.  This is NOT the same value as hashing the whole
+ *     file in one shot, so the receiver uses the same algorithm to verify.
  *
- * Stage 12 changes:
- * - Sender streams the file in chunks using FileReader slice (never loads
- *   full file into RAM). Chunk hashes are sent inline with each chunk as a
- *   small header prefix, eliminating the huge upfront metadata JSON.
- * - Receiver writes chunks directly to OPFS/IndexedDB via chunkStore.
- * - receivedChunks is always null — ReceiverPage uses chunkStore for download.
+ *   ⚠  If you need byte-identical SHA-256 of the concatenated file you would
+ *      need a Web Worker + WASM hash library (e.g. hash-wasm).  The
+ *      incremental approach here gives equally strong tamper-detection with
+ *      zero extra RAM on the sender.
+ *
+ * Receiver changes:
+ *   - doFileHashVerify() reads chunks one at a time from the store and
+ *     recomputes the same incremental hash instead of loading the whole
+ *     file into a single ArrayBuffer.  RAM usage is O(1) per chunk.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createChunkStore } from '../storage/chunkStore';
 
-export const CHUNK_SIZE = 256 * 1024; // 256 KB — good balance for large files
+export const CHUNK_SIZE = 256 * 1024; // 256 KB
 
-/** Convert an ArrayBuffer to a lowercase hex string. */
+// ── Hashing helpers ──────────────────────────────────────────────────────────
+
+/** SHA-256 of an ArrayBuffer → lowercase hex string */
 async function sha256hex(buffer) {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-  return Array.from(new Uint8Array(hashBuffer))
+  const hash = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(hash))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
 }
 
-/** Read a slice of a File as ArrayBuffer without loading the whole file. */
+/**
+ * Incremental "running hash":  H_n = SHA-256( H_{n-1}_bytes || chunk_bytes )
+ *
+ * Starts with a zero-filled 32-byte seed so the first step is effectively
+ * SHA-256( 0x00…00 || chunk_0 ).
+ *
+ * Both sender and receiver use this function identically, so the final value
+ * is always consistent without holding the full file in RAM.
+ */
+async function updateRunningHash(prevHashHex, chunkBuffer) {
+  // Convert previous hex hash to bytes
+  const prevBytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    prevBytes[i] = parseInt(prevHashHex.slice(i * 2, i * 2 + 2), 16);
+  }
+  // Concatenate prev-hash bytes + chunk bytes
+  const combined = new Uint8Array(32 + chunkBuffer.byteLength);
+  combined.set(prevBytes, 0);
+  combined.set(new Uint8Array(chunkBuffer), 32);
+  return sha256hex(combined.buffer);
+}
+
+const INITIAL_HASH = '0'.repeat(64); // 32 zero bytes in hex
+
+// ── Misc helpers ─────────────────────────────────────────────────────────────
+
 function readSlice(file, start, end) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload  = (e) => resolve(e.target.result);
-    reader.onerror = ()  => reject(new Error('Failed to read file slice'));
+    reader.onload = (e) => resolve(e.target.result);
+    reader.onerror = () => reject(new Error('Failed to read file slice'));
     reader.readAsArrayBuffer(file.slice(start, end));
   });
 }
 
-/**
- * Wait for the DataChannel buffer to drain below threshold.
- * Returns false immediately if the channel closed while waiting.
- */
 function waitForBufferDrain(dc, highWaterMark) {
   return new Promise((resolve) => {
     if (dc.bufferedAmount <= highWaterMark) { resolve(true); return; }
-
     const onLow = () => { cleanup(); resolve(true); };
     const onClose = () => { cleanup(); resolve(false); };
-
     function cleanup() {
       dc.removeEventListener('bufferedamountlow', onLow);
       dc.removeEventListener('close', onClose);
       dc.removeEventListener('error', onClose);
     }
-
     dc.addEventListener('bufferedamountlow', onLow);
     dc.addEventListener('close', onClose);
     dc.addEventListener('error', onClose);
   });
 }
 
-export default function useFileTransfer({ dataChannel, role, file, transferId }) {
-  const [status,           setStatus]           = useState('idle');
-  const [progress,         setProgress]         = useState(0);
-  const [bytesTransferred, setBytesTransferred] = useState(0);
-  const [totalBytes,       setTotalBytes]       = useState(0);
-  const [chunksReceived,   setChunksReceived]   = useState(0);
-  const [totalChunks,      setTotalChunks]      = useState(0);
-  const [receivedMetadata, setReceivedMetadata] = useState(null);
-  const [receivedChunks]                        = useState(null); // always null — Stage 12
-  const [chunkStore,       setChunkStore]       = useState(null);
-  const [storageKind,      setStorageKind]      = useState(null);
-  const [error,            setError]            = useState(null);
-  const [transferSpeed,    setTransferSpeed]    = useState(0);
+// ── Hook ─────────────────────────────────────────────────────────────────────
 
-  const lastSnapshotRef  = useRef({ bytes: 0, time: Date.now() });
-  const metaRef          = useRef(null);
-  const storeRef         = useRef(null);
-  const isSendingRef     = useRef(false);
-  // receiver chunk tracking
-  const chunkIdxRef      = useRef(0);
+export default function useFileTransfer({ dataChannel, role, file, transferId }) {
+  const [status, setStatus] = useState('idle');
+  const [progress, setProgress] = useState(0);
+  const [bytesTransferred, setBytesTransferred] = useState(0);
+  const [totalBytes, setTotalBytes] = useState(0);
+  const [chunksReceived, setChunksReceived] = useState(0);
+  const [totalChunks, setTotalChunks] = useState(0);
+  const [receivedMetadata, setReceivedMetadata] = useState(null);
+  const [receivedChunks] = useState(null); // always null
+  const [chunkStore, setChunkStore] = useState(null);
+  const [storageKind, setStorageKind] = useState(null);
+  const [error, setError] = useState(null);
+  const [transferSpeed, setTransferSpeed] = useState(0);
+
+  const lastSnapshotRef = useRef({ bytes: 0, time: Date.now() });
+  const metaRef = useRef(null);
+  const storeRef = useRef(null);
+  const isSendingRef = useRef(false);
+  const chunkIdxRef = useRef(0);
   const verifiedCountRef = useRef(0);
-  // pending chunks that arrived before the store was ready
   const pendingChunksRef = useRef([]);
 
-  // ── Speed tracking ────────────────────────────────────────────────────
   const updateSpeed = useCallback((totalBytesNow) => {
     const now = Date.now();
     const { bytes: prevBytes, time: prevTime } = lastSnapshotRef.current;
@@ -93,7 +121,8 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
     }
   }, []);
 
-  // ── SENDER ────────────────────────────────────────────────────────────
+  // ── SENDER ────────────────────────────────────────────────────────────────
+
   useEffect(() => {
     if (role !== 'sender' || !dataChannel || !file) return;
 
@@ -101,9 +130,8 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       if (isSendingRef.current) return;
       isSendingRef.current = true;
 
-      // Tune DataChannel for large transfers
-      dataChannel.bufferedAmountLowThreshold = 256 * 1024; // 256 KB low-water mark
-      const HIGH_WATER = 2 * 1024 * 1024; // pause sending above 2 MB buffered
+      dataChannel.bufferedAmountLowThreshold = 256 * 1024;
+      const HIGH_WATER = 2 * 1024 * 1024;
 
       try {
         setStatus('transferring');
@@ -113,8 +141,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         const numChunks = Math.ceil(file.size / CHUNK_SIZE);
         setTotalChunks(numChunks);
 
-        // ── 1. Send lightweight metadata (NO chunk hashes upfront) ──────
-        // Chunk hashes are sent inline with each chunk to avoid a huge JSON message.
+        // Lightweight metadata — no upfront chunk hashes
         const metadata = {
           type: 'metadata',
           name: file.name,
@@ -122,7 +149,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           mimeType: file.type || 'application/octet-stream',
           totalChunks: numChunks,
           chunkSize: CHUNK_SIZE,
-          // fileHash sent separately after all chunks
+          hashAlgo: 'incremental-sha256', // signals receiver to use same algo
         };
 
         if (dataChannel.readyState !== 'open') {
@@ -130,28 +157,21 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         }
         dataChannel.send(JSON.stringify(metadata));
 
-        // ── 2. Stream chunks: read → hash → send, one at a time ─────────
         let bytesSent = 0;
-        let fileHashData = null; // accumulate for final whole-file hash
-
-        // We'll hash the full file on the fly using a streaming approach.
-        // For simplicity (SubtleCrypto doesn't stream), we collect all chunks
-        // to build the whole-file hash after sending, then send it as a footer.
-        // For very large files the full-file hash costs a re-read; we skip it
-        // and rely on per-chunk hashes for integrity (still strong).
-        // To avoid a second full read, we compute it from the slices we already have.
-        const allChunkBuffers = []; // kept for final hash only — GC'd after
+        let runningHash = INITIAL_HASH; // incremental full-file hash — O(1) RAM
 
         for (let i = 0; i < numChunks; i++) {
           const start = i * CHUNK_SIZE;
-          const end   = Math.min(start + CHUNK_SIZE, file.size);
+          const end = Math.min(start + CHUNK_SIZE, file.size);
           const chunk = await readSlice(file, start, end);
 
-          // Hash this chunk
+          // Per-chunk hash (for immediate tamper detection on the receiver)
           const chunkHash = await sha256hex(chunk);
-          allChunkBuffers.push(chunk);
 
-          // Backpressure: wait if the send buffer is too full
+          // Update running full-file hash — NO buffer accumulation
+          runningHash = await updateRunningHash(runningHash, chunk);
+
+          // Backpressure
           if (dataChannel.bufferedAmount > HIGH_WATER) {
             const ok = await waitForBufferDrain(dataChannel, HIGH_WATER / 2);
             if (!ok || dataChannel.readyState !== 'open') {
@@ -159,7 +179,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
             }
           }
 
-          // Send chunk header (JSON) then the raw binary
+          // Send header then binary
           const header = JSON.stringify({ type: 'chunk', index: i, hash: chunkHash });
           try {
             dataChannel.send(header);
@@ -173,21 +193,15 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           setProgress(Math.round((bytesSent / file.size) * 100));
           updateSpeed(bytesSent);
 
-          // Yield to the event loop every 20 chunks to keep the connection alive
-          if (i % 20 === 0) {
-            await new Promise((r) => setTimeout(r, 0));
-          }
+          // Yield to event loop every 20 chunks
+          if (i % 20 === 0) await new Promise((r) => setTimeout(r, 0));
         }
 
-        // ── 3. Compute and send whole-file hash ──────────────────────────
-        const fullBlob   = new Blob(allChunkBuffers);
-        const fullBuffer = await fullBlob.arrayBuffer();
-        const fileHash   = await sha256hex(fullBuffer);
-
+        // Send incremental full-file hash as footer
         if (dataChannel.readyState !== 'open') {
           throw new Error('Connection lost before sending file hash.');
         }
-        dataChannel.send(JSON.stringify({ type: 'filehash', hash: fileHash }));
+        dataChannel.send(JSON.stringify({ type: 'filehash', hash: runningHash }));
 
         setTransferSpeed(0);
         setStatus('done');
@@ -206,21 +220,17 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
     }
   }, [dataChannel, role, file, updateSpeed]);
 
-  // ── RECEIVER ─────────────────────────────────────────────────────────
+  // ── RECEIVER ──────────────────────────────────────────────────────────────
+
   useEffect(() => {
     if (role !== 'receiver' || !dataChannel) return;
 
-    // Reset per-transfer counters whenever the dataChannel changes
-    chunkIdxRef.current      = 0;
+    chunkIdxRef.current = 0;
     verifiedCountRef.current = 0;
     pendingChunksRef.current = [];
 
-    /**
-     * Process a verified chunk: write to store and update progress.
-     * Called both from the live message handler and when draining pendingChunks.
-     */
     const processChunk = async (idx, chunk) => {
-      const meta  = metaRef.current;
+      const meta = metaRef.current;
       const store = storeRef.current;
       if (!meta || !store) return;
 
@@ -242,42 +252,42 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       updateSpeed(bytesNow);
 
       if (verified === meta.totalChunks) {
-        await finalize(store, meta);
+        setStatus('verifying');
+        setTransferSpeed(0);
+        if (store.flush) {
+          try { await store.flush(); } catch { /* no-op */ }
+        }
+        // If the filehash footer already arrived, verify now
+        if (fileHashRef.current !== null) {
+          await doFileHashVerify();
+        }
       }
     };
 
-    const finalize = async (store, meta) => {
-      setStatus('verifying');
-      setTransferSpeed(0);
-
-      if (store.flush) {
-        try { await store.flush(); } catch { /* no-op */ }
-      }
-
-      // Full-file verification using the hash sent in the footer message.
-      // If fileHashRef isn't set yet (footer message hasn't arrived), we
-      // wait for it — handled in the 'filehash' branch of handleMessage.
-    };
-
-    // fileHash from the footer; we verify once both the last chunk and the
-    // footer have arrived (whichever comes last).
     const fileHashRef = { current: null };
     const finalizeCalledRef = { current: false };
 
+    /**
+     * Verify full-file integrity using the same incremental SHA-256 as the
+     * sender — reads one chunk at a time from the store, O(1) RAM.
+     */
     const doFileHashVerify = async () => {
       if (finalizeCalledRef.current) return;
       finalizeCalledRef.current = true;
 
-      const meta  = metaRef.current;
+      const meta = metaRef.current;
       const store = storeRef.current;
       if (!meta || !store) return;
 
       try {
-        const allChunks  = await store.readAll();
-        const fullBuffer = await new Blob(allChunks).arrayBuffer();
-        const fullHash   = await sha256hex(fullBuffer);
+        let runningHash = INITIAL_HASH;
+        for (let i = 0; i < meta.totalChunks; i++) {
+          const chunk = await store.read(i);
+          runningHash = await updateRunningHash(runningHash, chunk);
+          if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
+        }
 
-        if (fullHash !== fileHashRef.current) {
+        if (runningHash !== fileHashRef.current) {
           setError('Full-file integrity check failed. The file may be corrupted.');
           setStatus('error');
           return;
@@ -293,11 +303,10 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       setStatus('done');
     };
 
-    // Track whether we're awaiting a binary chunk after a chunk header
     let pendingChunkHeader = null;
 
     const handleMessage = async (event) => {
-      // ── Text messages (metadata / chunk header / filehash) ────────────
+      // ── Text (metadata / chunk header / filehash) ──
       if (typeof event.data === 'string') {
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
@@ -310,9 +319,8 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           setStatus('transferring');
           lastSnapshotRef.current = { bytes: 0, time: Date.now() };
 
-          // Set up disk-backed storage
           try {
-            const id    = transferId || 'transfer';
+            const id = transferId || 'transfer';
             const store = await createChunkStore(id, msg.totalChunks, msg.chunkSize || CHUNK_SIZE);
             storeRef.current = store;
             setChunkStore(store);
@@ -321,7 +329,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
             // Drain any chunks that arrived before the store was ready
             const pending = pendingChunksRef.current.splice(0);
             for (const { idx, chunk } of pending) {
-              const expectedHash = pending._hashes?.[idx]; // not used here; hash already verified
               await processChunk(idx, chunk);
             }
           } catch (err) {
@@ -333,14 +340,12 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         }
 
         if (msg.type === 'chunk') {
-          // Next binary message will be this chunk's payload
-          pendingChunkHeader = msg; // { index, hash }
+          pendingChunkHeader = msg;
           return;
         }
 
         if (msg.type === 'filehash') {
           fileHashRef.current = msg.hash;
-          // If all chunks are already verified, run final check now
           const meta = metaRef.current;
           if (meta && verifiedCountRef.current === meta.totalChunks) {
             await doFileHashVerify();
@@ -351,17 +356,17 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         return;
       }
 
-      // ── Binary message (chunk payload, follows a 'chunk' header) ───────
+      // ── Binary (chunk payload) ──
       if (!(event.data instanceof ArrayBuffer)) return;
 
       const header = pendingChunkHeader;
       pendingChunkHeader = null;
-      if (!header) return; // unexpected binary, ignore
+      if (!header) return;
 
       const chunk = event.data;
-      const idx   = header.index;
+      const idx = header.index;
 
-      // Verify chunk hash
+      // Per-chunk integrity check
       const hash = await sha256hex(chunk);
       if (hash !== header.hash) {
         setError(`Chunk ${idx + 1} failed integrity check. File may be corrupted.`);
@@ -369,19 +374,12 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         return;
       }
 
-      // If store isn't ready yet, queue the chunk
       if (!storeRef.current) {
         pendingChunksRef.current.push({ idx, chunk });
         return;
       }
 
       await processChunk(idx, chunk);
-
-      // Check if we can now run the full-file hash (if footer already arrived)
-      const meta = metaRef.current;
-      if (meta && verifiedCountRef.current === meta.totalChunks && fileHashRef.current) {
-        await doFileHashVerify();
-      }
     };
 
     dataChannel.addEventListener('message', handleMessage);

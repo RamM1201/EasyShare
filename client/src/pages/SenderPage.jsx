@@ -11,8 +11,8 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import useSignalingSocket from '../hooks/useSignalingSocket';
 
-// Stage 12: raise to 2 GB — the UI will warn; actual limit is browser RAM/storage
-const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
+// Stage 12: raise to 10 GB — the UI will warn; actual limit is browser RAM/storage
+const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB
 
 /** Format bytes to a human-readable string. */
 function formatBytes(bytes) {

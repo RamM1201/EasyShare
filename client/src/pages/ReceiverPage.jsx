@@ -13,19 +13,19 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import useSignalingSocket from '../hooks/useSignalingSocket';
-import useWebRTC          from '../hooks/useWebRTC';
-import useFileTransfer    from '../hooks/useFileTransfer';
+import useWebRTC from '../hooks/useWebRTC';
+import useFileTransfer from '../hooks/useFileTransfer';
 
 /** Format bytes to a human-readable string. */
 function formatBytes(bytes) {
-  if (bytes < 1024)             return `${bytes} B`;
-  if (bytes < 1024 * 1024)     return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** Format bytes/sec to MB/s or KB/s string. */
 function formatSpeed(bps) {
-  if (bps <= 0)          return '—';
+  if (bps <= 0) return '—';
   if (bps >= 1024 * 1024) return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
   return `${(bps / 1024).toFixed(0)} KB/s`;
 }
@@ -33,13 +33,13 @@ function formatSpeed(bps) {
 // ── ConnectionBadge ──────────────────────────────────────────────────────────
 
 const BADGE_CONFIG = {
-  connecting:   { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300',  label: 'Connecting…'           },
-  waiting:      { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300',  label: 'Waiting for peer…'     },
-  connected:    { dot: 'bg-green-400',                text: 'text-green-300',   label: 'Connected'             },
-  interrupted:  { dot: 'bg-orange-400',               text: 'text-orange-300',  label: 'Transfer interrupted'  },
-  disconnected: { dot: 'bg-red-400',                  text: 'text-red-300',     label: 'Disconnected'          },
-  error:        { dot: 'bg-red-400',                  text: 'text-red-300',     label: 'Error'                 },
-  done:         { dot: 'bg-green-400',                text: 'text-green-300',   label: 'Transfer complete'     },
+  connecting: { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Connecting…' },
+  waiting: { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Waiting for peer…' },
+  connected: { dot: 'bg-green-400', text: 'text-green-300', label: 'Connected' },
+  interrupted: { dot: 'bg-orange-400', text: 'text-orange-300', label: 'Transfer interrupted' },
+  disconnected: { dot: 'bg-red-400', text: 'text-red-300', label: 'Disconnected' },
+  error: { dot: 'bg-red-400', text: 'text-red-300', label: 'Error' },
+  done: { dot: 'bg-green-400', text: 'text-green-300', label: 'Transfer complete' },
 };
 
 function ConnectionBadge({ status }) {
@@ -140,11 +140,18 @@ async function streamDownload(store, metadata, totalChunks) {
   }
 
   // Option C — plain Blob fallback (loads the whole file into memory)
+  // Guard: refuse to Blob-download files > 2 GB to avoid OOM crashes
+  if (metadata.size > 2 * 1024 * 1024 * 1024) {
+    throw new Error(
+      'Your browser does not support streaming downloads for files this large. ' +
+      'Please use Chrome or Edge.'
+    );
+  }
   const allChunks = await store.readAll();
   const blob = new Blob(allChunks, { type: mimeType });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
   a.download = metadata.name;
   a.click();
   URL.revokeObjectURL(url);
@@ -153,23 +160,23 @@ async function streamDownload(store, metadata, totalChunks) {
 // ── Main page ────────────────────────────────────────────────────────────────
 
 export default function ReceiverPage() {
-  const { roomId }  = useParams();
-  const location    = useLocation();
-  const navigate    = useNavigate();
-  const socketRef   = useSignalingSocket();
+  const { roomId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const socketRef = useSignalingSocket();
 
   // Determine role from router state (sender navigated here; receiver opens URL directly)
-  const isSender    = location.state?.role === 'sender';
-  const fileToSend  = location.state?.file ?? null;
+  const isSender = location.state?.role === 'sender';
+  const fileToSend = location.state?.file ?? null;
 
-  const [peerId,           setPeerId]           = useState(location.state?.peerId ?? null);
-  const [joinError,        setJoinError]         = useState('');
+  const [peerId, setPeerId] = useState(location.state?.peerId ?? null);
+  const [joinError, setJoinError] = useState('');
   const [connectionStatus, setConnectionStatus] = useState('connecting');
-  const [copyLabel,        setCopyLabel]         = useState('Copy link');
-  const [downloadPhase,    setDownloadPhase]    = useState('idle'); // 'idle' | 'writing' | 'cleaning' | 'done'
+  const [copyLabel, setCopyLabel] = useState('Copy link');
+  const [downloadPhase, setDownloadPhase] = useState('idle'); // 'idle' | 'writing' | 'cleaning' | 'done'
 
-  const hasJoinedRef   = useRef(false);
-  const downloadedRef  = useRef(false);
+  const hasJoinedRef = useRef(false);
+  const downloadedRef = useRef(false);
 
   const shareUrl = `${window.location.origin}/r/${roomId}`;
 
@@ -199,15 +206,15 @@ export default function ReceiverPage() {
       }
     };
 
-    socket.on('room-joined',  onRoomJoined);
-    socket.on('peer-joined',  onPeerJoined);
+    socket.on('room-joined', onRoomJoined);
+    socket.on('peer-joined', onPeerJoined);
     socket.on('signaling-error', onError);
     socket.emit('join-room', { roomId });
 
     return () => {
       hasJoinedRef.current = false;
-      socket.off('room-joined',  onRoomJoined);
-      socket.off('peer-joined',  onPeerJoined);
+      socket.off('room-joined', onRoomJoined);
+      socket.off('peer-joined', onPeerJoined);
       socket.off('signaling-error', onError);
     };
   }, [isSender, roomId, socketRef]);
@@ -230,7 +237,7 @@ export default function ReceiverPage() {
   const { dataChannel, connectionState, error: rtcError, peerLeft } =
     useWebRTC({
       socket: socketRef.current,
-      role:   isSender ? 'sender' : 'receiver',
+      role: isSender ? 'sender' : 'receiver',
       peerId,
     });
 
@@ -248,8 +255,8 @@ export default function ReceiverPage() {
     error: transferError,
   } = useFileTransfer({
     dataChannel,
-    role:  isSender ? 'sender' : 'receiver',
-    file:  fileToSend,
+    role: isSender ? 'sender' : 'receiver',
+    file: fileToSend,
     transferId: roomId,
   });
 
@@ -285,11 +292,11 @@ export default function ReceiverPage() {
 
   // ── Auto-download when done (receiver only) — streams from chunkStore ──
   useEffect(() => {
-    if (isSender)                     return;
-    if (status !== 'done')            return;
-    if (downloadedRef.current)        return;
-    if (!chunkStore)                  return;
-    if (!receivedMetadata)            return;
+    if (isSender) return;
+    if (status !== 'done') return;
+    if (downloadedRef.current) return;
+    if (!chunkStore) return;
+    if (!receivedMetadata) return;
 
     downloadedRef.current = true;
 
@@ -515,13 +522,13 @@ export default function ReceiverPage() {
               || connectionStatus === 'interrupted'
               || connectionStatus === 'error'
               || status === 'done') && (
-              <button
-                onClick={() => navigate('/')}
-                className="w-full text-sm text-center text-indigo-400 hover:text-indigo-300 underline underline-offset-2 transition-colors"
-              >
-                ← Start a new transfer
-              </button>
-            )}
+                <button
+                  onClick={() => navigate('/')}
+                  className="w-full text-sm text-center text-indigo-400 hover:text-indigo-300 underline underline-offset-2 transition-colors"
+                >
+                  ← Start a new transfer
+                </button>
+              )}
           </div>
         </div>
       )}
@@ -534,7 +541,7 @@ function PulseIcon() {
   return (
     <svg className="w-8 h-8 text-indigo-500 animate-pulse" fill="none" viewBox="0 0 24 24">
       <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 2" />
-      <circle cx="12" cy="12" r="4"  fill="currentColor" />
+      <circle cx="12" cy="12" r="4" fill="currentColor" />
     </svg>
   );
 }
