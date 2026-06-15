@@ -61,6 +61,8 @@ export default function useFileTransfer({ dataChannel, role, file }) {
   const chunksBufferRef = useRef([]);  // accumulates chunks without triggering renders
   const metaRef         = useRef(null);
   const isSendingRef = useRef(false);
+  const chunkIdxRef = useRef(0);
+  const verifiedCountRef = useRef(0);
 
   // ── Speed tracking helper ──────────────────────────────────────────────
   const updateSpeed = useCallback((totalBytesNow) => {
@@ -183,8 +185,7 @@ export default function useFileTransfer({ dataChannel, role, file }) {
   useEffect(() => {
     if (role !== 'receiver' || !dataChannel) return;
 
-    const chunkIdxRef = useRef(0);
-    const verifiedCountRef = useRef(0);
+    
 
     const handleMessage = async (event) => {
       // First message: JSON metadata
