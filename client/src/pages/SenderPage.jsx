@@ -43,7 +43,7 @@ export default function SenderPage() {
     setFileError('');
     if (!f) return;
     if (f.size > MAX_FILE_SIZE) {
-      setFileError(`File is too large (${formatBytes(f.size)}). Maximum size is 2 GB.`);
+      setFileError(`File is too large (${formatBytes(f.size)}). Maximum size is 10 GB.`);
       return;
     }
     setFile(f);
@@ -168,7 +168,7 @@ export default function SenderPage() {
                 <p className="text-sm text-gray-300">
                   <span className="font-medium text-white">Click to choose</span> or drag &amp; drop
                 </p>
-                <p className="text-xs text-gray-500 mt-1">Any file up to 2 GB</p>
+                <p className="text-xs text-gray-500 mt-1">Any file up to 10 GB</p>
               </div>
             </>
           )}
