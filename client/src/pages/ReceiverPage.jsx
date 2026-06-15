@@ -30,16 +30,35 @@ function formatSpeed(bps) {
   return `${(bps / 1024).toFixed(0)} KB/s`;
 }
 
+/**
+ * Format seconds into a compact, human-friendly ETA string.
+ *
+ * Examples:  3 → "3s"   75 → "1m 15s"   3700 → "1h 1m"
+ * We drop the seconds component once the estimate exceeds a minute —
+ * showing "1m 15s" is useful, but "1h 1m 3s" adds false precision.
+ */
+function formatETA(seconds) {
+  if (seconds == null || seconds <= 0) return null;
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return remM > 0 ? `${h}h ${remM}m` : `${h}h`;
+}
+
 // ── ConnectionBadge ──────────────────────────────────────────────────────────
 
 const BADGE_CONFIG = {
-  connecting: { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Connecting…' },
-  waiting: { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Waiting for peer…' },
-  connected: { dot: 'bg-green-400', text: 'text-green-300', label: 'Connected' },
-  interrupted: { dot: 'bg-orange-400', text: 'text-orange-300', label: 'Transfer interrupted' },
-  disconnected: { dot: 'bg-red-400', text: 'text-red-300', label: 'Disconnected' },
-  error: { dot: 'bg-red-400', text: 'text-red-300', label: 'Error' },
-  done: { dot: 'bg-green-400', text: 'text-green-300', label: 'Transfer complete' },
+  connecting:   { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Connecting…' },
+  waiting:      { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Waiting for peer…' },
+  connected:    { dot: 'bg-green-400',                text: 'text-green-300',  label: 'Connected' },
+  interrupted:  { dot: 'bg-orange-400',               text: 'text-orange-300', label: 'Transfer interrupted' },
+  disconnected: { dot: 'bg-red-400',                  text: 'text-red-300',    label: 'Disconnected' },
+  error:        { dot: 'bg-red-400',                  text: 'text-red-300',    label: 'Error' },
+  done:         { dot: 'bg-green-400',                text: 'text-green-300',  label: 'Transfer complete' },
 };
 
 function ConnectionBadge({ status }) {
@@ -54,8 +73,11 @@ function ConnectionBadge({ status }) {
 
 // ── TransferProgress ─────────────────────────────────────────────────────────
 
-function TransferProgress({ progress, bytesTransferred, totalBytes, speed, status }) {
+function TransferProgress({ progress, bytesTransferred, totalBytes, speed, eta, status }) {
   const isDone = status === 'done';
+  const isActive = !isDone && status === 'transferring';
+  const etaStr = isActive ? formatETA(eta) : null;
+
   return (
     <div className="space-y-2">
       {/* Bar */}
@@ -72,14 +94,31 @@ function TransferProgress({ progress, bytesTransferred, totalBytes, speed, statu
           aria-valuemax={100}
         />
       </div>
+
       {/* Stats row */}
       <div className="flex items-center justify-between text-xs text-gray-400">
+        {/* Left: bytes transferred */}
         <span>
           {formatBytes(bytesTransferred)} / {formatBytes(totalBytes)}
         </span>
+
+        {/* Right: speed · ETA · percent */}
         <span className="flex items-center gap-2">
-          {!isDone && status === 'transferring' && (
-            <span className="text-indigo-300">{formatSpeed(speed)}</span>
+          {isActive && (
+            <>
+              <span className="text-indigo-300">{formatSpeed(speed)}</span>
+              {etaStr && (
+                <>
+                  <span className="text-gray-600" aria-hidden="true">·</span>
+                  <span
+                    className="text-gray-300 tabular-nums"
+                    aria-label={`Estimated time remaining: ${etaStr}`}
+                  >
+                    {etaStr} left
+                  </span>
+                </>
+              )}
+            </>
           )}
           <span className="tabular-nums font-medium text-white">{progress}%</span>
         </span>
@@ -114,20 +153,14 @@ async function streamDownload(store, metadata, totalChunks) {
       await writable.close();
       return;
     } catch (err) {
-      // AbortError = user cancelled the save dialog; don't fall back in that case.
-      if (err && err.name === 'AbortError') {
-        throw err;
-      }
-      // Otherwise (e.g. not supported in this context) fall through.
+      if (err && err.name === 'AbortError') throw err;
     }
   }
 
   // Option B — StreamSaver.js (cross-browser)
   try {
     const { default: streamSaver } = await import('streamsaver');
-    const writeStream = streamSaver.createWriteStream(metadata.name, {
-      size: metadata.size,
-    });
+    const writeStream = streamSaver.createWriteStream(metadata.name, { size: metadata.size });
     const writer = writeStream.getWriter();
     for (let i = 0; i < totalChunks; i++) {
       const buf = await store.read(i);
@@ -139,8 +172,7 @@ async function streamDownload(store, metadata, totalChunks) {
     console.warn('[ReceiverPage] StreamSaver unavailable, falling back to Blob download:', err);
   }
 
-  // Option C — plain Blob fallback (loads the whole file into memory)
-  // Guard: refuse to Blob-download files > 2 GB to avoid OOM crashes
+  // Option C — plain Blob fallback
   if (metadata.size > 2 * 1024 * 1024 * 1024) {
     throw new Error(
       'Your browser does not support streaming downloads for files this large. ' +
@@ -165,7 +197,6 @@ export default function ReceiverPage() {
   const navigate = useNavigate();
   const socketRef = useSignalingSocket();
 
-  // Determine role from router state (sender navigated here; receiver opens URL directly)
   const isSender = location.state?.role === 'sender';
   const fileToSend = location.state?.file ?? null;
 
@@ -173,9 +204,9 @@ export default function ReceiverPage() {
   const [joinError, setJoinError] = useState('');
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [copyLabel, setCopyLabel] = useState('Copy link');
-  const [downloadPhase, setDownloadPhase] = useState('idle'); // 'idle' | 'writing' | 'cleaning' | 'done'
+  const [downloadPhase, setDownloadPhase] = useState('idle');
 
-  const hasJoinedRef = useRef(false);
+  const hasJoinedRef  = useRef(false);
   const downloadedRef = useRef(false);
 
   const shareUrl = `${window.location.origin}/r/${roomId}`;
@@ -188,14 +219,9 @@ export default function ReceiverPage() {
     hasJoinedRef.current = true;
 
     const onRoomJoined = ({ peerIds }) => {
-      // peerIds[0] is the sender's socket ID
       if (peerIds.length > 0) setPeerId(peerIds[0]);
     };
-
-    const onPeerJoined = ({ peerId: id }) => {
-      setPeerId(id);
-    };
-
+    const onPeerJoined = ({ peerId: id }) => setPeerId(id);
     const onError = ({ message, reason }) => {
       if (reason === 'not-found') {
         setJoinError('Room not found. The link may have expired.');
@@ -219,16 +245,12 @@ export default function ReceiverPage() {
     };
   }, [isSender, roomId, socketRef]);
 
-  // ── Sender: wait for peer then navigate (already on this page) ────────
+  // ── Sender: watch for peer ─────────────────────────────────────────────
   useEffect(() => {
     if (!isSender) return;
     const socket = socketRef.current;
     if (!socket) return;
-
-    const onPeerJoined = ({ peerId: id }) => {
-      setPeerId(id);
-    };
-
+    const onPeerJoined = ({ peerId: id }) => setPeerId(id);
     socket.on('peer-joined', onPeerJoined);
     return () => socket.off('peer-joined', onPeerJoined);
   }, [isSender, socketRef]);
@@ -248,6 +270,7 @@ export default function ReceiverPage() {
     bytesTransferred,
     totalBytes,
     transferSpeed,
+    eta,
     receivedMetadata,
     totalChunks,
     chunkStore,
@@ -260,14 +283,14 @@ export default function ReceiverPage() {
     transferId: roomId,
   });
 
-  // ── Derive connection badge status ────────────────────────────────────
+  // ── Connection badge ───────────────────────────────────────────────────
   useEffect(() => {
     if (transferError || rtcError) {
       setConnectionStatus('error');
     } else if (status === 'done') {
       setConnectionStatus('done');
     } else if (peerLeft) {
-      // handled separately below
+      // handled below
     } else if (connectionState === 'connected') {
       setConnectionStatus('connected');
     } else if (connectionState === 'failed' || connectionState === 'disconnected') {
@@ -279,10 +302,10 @@ export default function ReceiverPage() {
     }
   }, [connectionState, status, peerId, peerLeft, transferError, rtcError]);
 
-  // ── Peer-left: handle all three disconnect scenarios ──────────────────
+  // ── Peer-left handling ─────────────────────────────────────────────────
   useEffect(() => {
     if (!peerLeft) return;
-    if (status === 'done') return;           // transfer already finished — ignore
+    if (status === 'done') return;
     if (status === 'transferring' || status === 'verifying') {
       setConnectionStatus('interrupted');
     } else {
@@ -290,7 +313,7 @@ export default function ReceiverPage() {
     }
   }, [peerLeft, status]);
 
-  // ── Auto-download when done (receiver only) — streams from chunkStore ──
+  // ── Auto-download when done (receiver only) ────────────────────────────
   useEffect(() => {
     if (isSender) return;
     if (status !== 'done') return;
@@ -308,21 +331,18 @@ export default function ReceiverPage() {
         await chunkStore.delete();
       } catch (err) {
         if (err && err.name === 'AbortError') {
-          // User cancelled the save dialog — allow retry.
           downloadedRef.current = false;
           setDownloadPhase('idle');
           return;
         }
         console.error('[ReceiverPage] Download error:', err);
       } finally {
-        if (downloadedRef.current) {
-          setDownloadPhase('done');
-        }
+        if (downloadedRef.current) setDownloadPhase('done');
       }
     })();
   }, [isSender, status, chunkStore, receivedMetadata, totalChunks]);
 
-  // ── Manual retry for save-dialog cancellation ─────────────────────────
+  // ── Manual retry ──────────────────────────────────────────────────────
   const handleRetryDownload = useCallback(() => {
     downloadedRef.current = false;
     setDownloadPhase('idle');
@@ -358,7 +378,7 @@ export default function ReceiverPage() {
         </h1>
       </div>
 
-      {/* Join error (room not found / full) */}
+      {/* Join error */}
       {joinError && (
         <div className="w-full max-w-md bg-red-950/50 border border-red-800 rounded-2xl p-5 mb-4 text-center">
           <p className="text-sm text-red-300 font-medium">⚠️ {joinError}</p>
@@ -408,7 +428,7 @@ export default function ReceiverPage() {
               </button>
             </div>
 
-            {/* Sender: waiting for peer prompt */}
+            {/* Sender: waiting for peer */}
             {isSender && connectionStatus === 'waiting' && (
               <div className="text-center py-4 space-y-2">
                 <p className="text-sm text-gray-300">Share this link with the recipient:</p>
@@ -429,25 +449,26 @@ export default function ReceiverPage() {
               </div>
             )}
 
-            {/* Transfer progress */}
+            {/* Transfer progress (shared by sender + receiver) */}
             {showProgress && (
               <TransferProgress
                 progress={progress}
                 bytesTransferred={bytesTransferred}
                 totalBytes={totalBytes}
                 speed={transferSpeed}
+                eta={eta}
                 status={status}
               />
             )}
 
-            {/* Verifying state */}
+            {/* Verifying */}
             {status === 'verifying' && (
               <p className="text-xs text-center text-indigo-300 animate-pulse">
                 Verifying file integrity…
               </p>
             )}
 
-            {/* Writing phase — IDB fallback path can be slow enough to show */}
+            {/* Writing phase */}
             {status === 'done' && !isSender && downloadPhase === 'writing' && (
               <p className="text-xs text-center text-indigo-300 animate-pulse">
                 {storageKind === 'indexeddb'
@@ -473,7 +494,7 @@ export default function ReceiverPage() {
               </div>
             )}
 
-            {/* Done but download was cancelled — offer retry */}
+            {/* Done but save was cancelled */}
             {status === 'done' && !isSender && downloadPhase === 'idle' && downloadedRef.current === false && (
               <div className="bg-yellow-950/40 border border-yellow-800 rounded-xl p-4 text-center space-y-2">
                 <p className="text-sm font-semibold text-yellow-300">Download not started</p>
@@ -502,7 +523,7 @@ export default function ReceiverPage() {
               </div>
             )}
 
-            {/* Disconnect: interrupted mid-transfer */}
+            {/* Interrupted mid-transfer */}
             {connectionStatus === 'interrupted' && !transferError && (
               <div className="bg-orange-950/40 border border-orange-800 rounded-xl p-4 space-y-1">
                 <p className="text-sm font-semibold text-orange-300">⚠️ Peer disconnected mid-transfer</p>
@@ -510,7 +531,7 @@ export default function ReceiverPage() {
               </div>
             )}
 
-            {/* Disconnect: before transfer started */}
+            {/* Disconnected before transfer */}
             {connectionStatus === 'disconnected' && !transferError && status !== 'done' && (
               <div className="bg-gray-800 border border-gray-700 rounded-xl p-4">
                 <p className="text-sm text-gray-300">🔴 Peer disconnected before the transfer started.</p>
@@ -536,7 +557,6 @@ export default function ReceiverPage() {
   );
 }
 
-/** Animated pulse icon for "waiting" state. */
 function PulseIcon() {
   return (
     <svg className="w-8 h-8 text-indigo-500 animate-pulse" fill="none" viewBox="0 0 24 24">

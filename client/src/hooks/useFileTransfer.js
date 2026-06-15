@@ -23,6 +23,14 @@
  *
  * Everything else (incremental SHA-256, backpressure, OPFS/IDB store,
  * streaming download) is unchanged.
+ *
+ * ETA (added):
+ *   Raw instantaneous speed is noisy. We smooth it with an exponential
+ *   moving average (EMA) using α=0.15 — new samples have 15% weight,
+ *   history has 85%. Samples are taken every 500 ms (unchanged). The
+ *   raw speed is exposed as `transferSpeed` for the UI, while the
+ *   smoothed speed is kept internally for `eta` (seconds remaining) and
+ *   exported as `smoothedTransferSpeed` if callers need it.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -87,6 +95,13 @@ function waitForBufferDrain(dc, highWaterMark) {
   });
 }
 
+// ── EMA speed smoothing ───────────────────────────────────────────────────────
+//
+// α = 0.15 → strong smoothing; new sample contributes 15%, history 85%.
+// Raised slightly from a pure "last-interval" value so the ETA reacts
+// to genuine speed changes within a few seconds rather than tens of seconds.
+const EMA_ALPHA = 0.15;
+
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 export default function useFileTransfer({ dataChannel, role, file, transferId }) {
@@ -102,31 +117,64 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
   const [storageKind,      setStorageKind]      = useState(null);
   const [error,            setError]            = useState(null);
   const [transferSpeed,    setTransferSpeed]    = useState(0);
+  const [smoothedTransferSpeed, setSmoothedTransferSpeed] = useState(0);
+  // Smoothed ETA in seconds; null = not yet calculable
+  const [eta,              setEta]              = useState(null);
 
   const lastSnapshotRef   = useRef({ bytes: 0, time: Date.now() });
+  // EMA state: smoothedSpeed is bytes/sec
+  const emaSpeedRef       = useRef(null); // null until first sample
   const metaRef           = useRef(null);
   const storeRef          = useRef(null);
   const isSendingRef      = useRef(false);
   const verifiedCountRef  = useRef(0);
 
   // ── Serial queue state (receiver) ─────────────────────────────────────
-  // pendingItemsRef holds { type: 'chunk', header, binary } | { type: 'filehash', hash }
-  // queueRunningRef prevents concurrent drains
   const pendingItemsRef  = useRef([]);
   const queueRunningRef  = useRef(false);
-  // items that arrived before metadata/store were ready
   const preStoreQueueRef = useRef([]);
 
   const fileHashRef        = useRef(null);
   const finalizeCalledRef  = useRef(false);
 
-  const updateSpeed = useCallback((totalBytesNow) => {
+  /**
+   * updateSpeed — called after every progress update.
+   *
+  * Computes the instantaneous speed over the last snapshot interval
+  * (≥ 500 ms), exposes it directly, feeds it into the EMA, then derives
+  * eta from the smoothed speed and remaining bytes.
+   *
+   * @param {number} totalBytesNow  — cumulative bytes transferred so far
+   * @param {number} fileSizeTotal  — total file size in bytes
+   */
+  const updateSpeed = useCallback((totalBytesNow, fileSizeTotal) => {
     const now = Date.now();
     const { bytes: prevBytes, time: prevTime } = lastSnapshotRef.current;
-    const elapsed = now - prevTime;
-    if (elapsed >= 500) {
-      setTransferSpeed(Math.max(0, ((totalBytesNow - prevBytes) / elapsed) * 1000));
-      lastSnapshotRef.current = { bytes: totalBytesNow, time: now };
+    const elapsed = now - prevTime; // ms
+
+    if (elapsed < 500) return; // wait for a meaningful interval
+
+    // Instantaneous speed for this interval (bytes/sec)
+    const instantSpeed = Math.max(0, ((totalBytesNow - prevBytes) / elapsed) * 1000);
+    lastSnapshotRef.current = { bytes: totalBytesNow, time: now };
+
+    setTransferSpeed(instantSpeed);
+
+    // Seed the EMA on first sample, otherwise blend
+    const prevEma = emaSpeedRef.current;
+    const smoothed = prevEma === null
+      ? instantSpeed
+      : EMA_ALPHA * instantSpeed + (1 - EMA_ALPHA) * prevEma;
+    emaSpeedRef.current = smoothed;
+
+    setSmoothedTransferSpeed(smoothed);
+
+    // Derive ETA from smoothed speed
+    if (smoothed > 0 && fileSizeTotal > 0) {
+      const remaining = fileSizeTotal - totalBytesNow;
+      setEta(remaining > 0 ? Math.ceil(remaining / smoothed) : 0);
+    } else {
+      setEta(null);
     }
   }, []);
 
@@ -146,6 +194,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         setStatus('transferring');
         setTotalBytes(file.size);
         lastSnapshotRef.current = { bytes: 0, time: Date.now() };
+        emaSpeedRef.current = null;
 
         const numChunks = Math.ceil(file.size / CHUNK_SIZE);
         setTotalChunks(numChunks);
@@ -194,7 +243,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           bytesSent += chunk.byteLength;
           setBytesTransferred(bytesSent);
           setProgress(Math.round((bytesSent / file.size) * 100));
-          updateSpeed(bytesSent);
+          updateSpeed(bytesSent, file.size);
 
           if (i % 20 === 0) await new Promise((r) => setTimeout(r, 0));
         }
@@ -205,12 +254,16 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         dataChannel.send(JSON.stringify({ type: 'filehash', hash: runningHash }));
 
         setTransferSpeed(0);
+        setSmoothedTransferSpeed(0);
+        setEta(0);
         setStatus('done');
       } catch (err) {
         console.error('[FileTransfer] Send error:', err);
         setError(err.message || 'Transfer failed.');
         setStatus('error');
         setTransferSpeed(0);
+        setSmoothedTransferSpeed(0);
+        setEta(null);
       }
     };
 
@@ -233,10 +286,8 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
     pendingItemsRef.current   = [];
     queueRunningRef.current   = false;
     preStoreQueueRef.current  = [];
+    emaSpeedRef.current       = null;
 
-    // ── Full-file integrity verification ──────────────────────────────────
-    // Called only after ALL chunks have been written AND the filehash footer
-    // has arrived. The serial queue ensures no writes are in-flight here.
     const doFileHashVerify = async () => {
       if (finalizeCalledRef.current) return;
       finalizeCalledRef.current = true;
@@ -245,7 +296,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       const store = storeRef.current;
       if (!meta || !store) return;
 
-      // Close the OPFS writable before reading back
       if (store.flush) {
         try { await store.flush(); } catch { /* no-op */ }
       }
@@ -255,7 +305,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         for (let i = 0; i < meta.totalChunks; i++) {
           const chunk = await store.read(i);
           runningHash = await updateRunningHash(runningHash, chunk);
-          // Yield every 50 chunks to avoid blocking the main thread
           if (i % 50 === 0) await new Promise((r) => setTimeout(r, 0));
         }
 
@@ -272,20 +321,18 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       }
 
       setProgress(100);
+      setEta(0);
       setStatus('done');
     };
 
-    // ── Process one chunk item (called only from drainQueue) ───────────────
-    // Guaranteed to run serially — no concurrent invocations.
     const processChunkItem = async ({ header, binary }) => {
       const meta  = metaRef.current;
       const store = storeRef.current;
       if (!meta || !store) return;
 
       const idx   = header.index;
-      const chunk = binary; // ArrayBuffer
+      const chunk = binary;
 
-      // Per-chunk integrity check
       const hash = await sha256hex(chunk);
       if (hash !== header.hash) {
         setError(`Chunk ${idx + 1} failed integrity check. File may be corrupted.`);
@@ -308,25 +355,21 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       setChunksReceived(verified);
       setBytesTransferred(bytesNow);
       setProgress(Math.round((verified / meta.totalChunks) * 100));
-      updateSpeed(bytesNow);
+      updateSpeed(bytesNow, meta.size);
 
-      // All chunks written — check if we can finalize
       if (verified === meta.totalChunks) {
         setStatus('verifying');
         setTransferSpeed(0);
-        // If filehash footer already arrived, verify now.
-        // Otherwise doFileHashVerify will be called when the footer arrives
-        // (also via the serial queue, so no race).
+        setSmoothedTransferSpeed(0);
+        setEta(null);
         if (fileHashRef.current !== null) {
           await doFileHashVerify();
         }
       }
     };
 
-    // ── Serial queue drain ─────────────────────────────────────────────────
-    // Ensures processChunkItem and doFileHashVerify are never concurrent.
     const drainQueue = async () => {
-      if (queueRunningRef.current) return; // already draining
+      if (queueRunningRef.current) return;
       queueRunningRef.current = true;
 
       while (pendingItemsRef.current.length > 0) {
@@ -340,7 +383,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
             if (meta && verifiedCountRef.current === meta.totalChunks) {
               await doFileHashVerify();
             }
-            // else: doFileHashVerify will be triggered after the last chunk
           }
         } catch (err) {
           console.error('[FileTransfer] Queue processing error:', err);
@@ -352,13 +394,9 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       queueRunningRef.current = false;
     };
 
-    // ── DataChannel message handler ────────────────────────────────────────
-    // Lightweight: just parse/buffer, then kick the queue.
-    // Never awaits anything itself so it returns immediately and never races.
     let pendingChunkHeader = null;
 
     const handleMessage = (event) => {
-      // ── Text: metadata / chunk header / filehash ──────────────────────
       if (typeof event.data === 'string') {
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
@@ -370,8 +408,10 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           setTotalChunks(msg.totalChunks);
           setStatus('transferring');
           lastSnapshotRef.current = { bytes: 0, time: Date.now() };
+          emaSpeedRef.current = null;
+          setTransferSpeed(0);
+          setSmoothedTransferSpeed(0);
 
-          // Initialise the chunk store asynchronously, then drain pre-store queue
           const id = transferId || 'transfer';
           createChunkStore(id, msg.totalChunks, msg.chunkSize || CHUNK_SIZE)
             .then((store) => {
@@ -379,7 +419,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
               setChunkStore(store);
               setStorageKind(store.kind);
 
-              // Enqueue anything that arrived before the store was ready
               const pre = preStoreQueueRef.current.splice(0);
               pendingItemsRef.current.push(...pre);
               drainQueue();
@@ -398,7 +437,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         }
 
         if (msg.type === 'filehash') {
-          // Enqueue so it's processed after any in-flight chunk items
           const item = { type: 'filehash', hash: msg.hash };
           if (!storeRef.current) {
             preStoreQueueRef.current.push(item);
@@ -412,7 +450,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         return;
       }
 
-      // ── Binary: chunk payload ──────────────────────────────────────────
       if (!(event.data instanceof ArrayBuffer)) return;
 
       const header = pendingChunkHeader;
@@ -422,7 +459,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       const item = { type: 'chunk', header, binary: event.data };
 
       if (!storeRef.current) {
-        // Store not ready yet — buffer until it is
         preStoreQueueRef.current.push(item);
       } else {
         pendingItemsRef.current.push(item);
@@ -447,5 +483,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
     storageKind,
     error,
     transferSpeed,
+    smoothedTransferSpeed,
+    eta,
   };
 }
