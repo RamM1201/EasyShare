@@ -65,6 +65,23 @@ export default function useWebRTC({ socket, role, peerId }) {
 
     // ── Create RTCPeerConnection ──────────────────────────────────────────
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pc.onicegatheringstatechange = () => {
+  console.log('[ICE] gathering state:', pc.iceGatheringState);
+};
+
+pc.oniceconnectionstatechange = () => {
+  console.log('[ICE] connection state:', pc.iceConnectionState);
+};
+
+pc.onicecandidate = ({ candidate }) => {
+  console.log('[ICE] candidate:', candidate?.type, candidate?.protocol, candidate?.address);
+  if (candidate) {
+    socket.emit('signal', {
+      to: peerId,
+      data: { type: 'ice-candidate', candidate },
+    });
+  }
+};
     pcRef.current = pc;
 
     // ── State change handlers ─────────────────────────────────────────────
