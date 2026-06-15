@@ -72,23 +72,29 @@ class OPFSChunkStore {
 
   /** Read one chunk back from disk for streaming download. */
   async read(index) {
-    // We need a separate File read; the writable stream doesn't support reads.
-    const file   = await this.fileHandle.getFile();
-    const start  = index * this.chunkSize;
-    const end    = Math.min(start + this.chunkSize, file.size);
-    return file.slice(start, end).arrayBuffer();
+    // flush() must be called before read() — writable must be closed first.
+  if (!this._closed) {
+    await this.flush();
+  }
+  const file   = await this.fileHandle.getFile();
+  const start  = index * this.chunkSize;
+  const end    = Math.min(start + this.chunkSize, file.size);
+  return file.slice(start, end).arrayBuffer();
   }
 
   /** Read all chunks sequentially — used by the Blob fallback path. */
   async readAll() {
-    const file   = await this.fileHandle.getFile();
-    const chunks = [];
-    for (let i = 0; i < this.totalChunks; i++) {
-      const start = i * this.chunkSize;
-      const end   = Math.min(start + this.chunkSize, file.size);
-      chunks.push(await file.slice(start, end).arrayBuffer());
-    }
-    return chunks;
+    if (!this._closed) {
+    await this.flush();
+  }
+  const file   = await this.fileHandle.getFile();
+  const chunks = [];
+  for (let i = 0; i < this.totalChunks; i++) {
+    const start = i * this.chunkSize;
+    const end   = Math.min(start + this.chunkSize, file.size);
+    chunks.push(await file.slice(start, end).arrayBuffer());
+  }
+  return chunks;
   }
 
   /** Close the writable stream — must be called before read() or delete(). */
