@@ -3,19 +3,23 @@
  *
  * Home page — drag-and-drop file selection, room creation, and share-link display.
  * After creating a room the sender navigates to /r/:roomId with role='sender'.
+ *
+ * Stage 12: file size limit raised to 2 GB (large-file support via OPFS/IDB).
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import useSignalingSocket from '../hooks/useSignalingSocket';
 
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+// Stage 12: raise to 2 GB — the UI will warn; actual limit is browser RAM/storage
+const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2 GB
 
 /** Format bytes to a human-readable string. */
 function formatBytes(bytes) {
-  if (bytes < 1024)             return `${bytes} B`;
-  if (bytes < 1024 * 1024)     return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 1024)                   return `${bytes} B`;
+  if (bytes < 1024 * 1024)           return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024)   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 export default function SenderPage() {
@@ -25,7 +29,7 @@ export default function SenderPage() {
   const [file,         setFile]         = useState(null);
   const [fileError,    setFileError]    = useState('');
   const [isDragging,   setIsDragging]   = useState(false);
-  const [isCreating,   setIsCreating]   = useState(false);  // waiting for room-created
+  const [isCreating,   setIsCreating]   = useState(false);
   const [roomId,       setRoomId]       = useState('');
   const [copyLabel,    setCopyLabel]    = useState('Copy link');
   const [sigError,     setSigError]     = useState('');
@@ -40,11 +44,11 @@ export default function SenderPage() {
     setFileError('');
     if (!f) return;
     if (f.size > MAX_FILE_SIZE) {
-      setFileError(`File is too large (${formatBytes(f.size)}). Maximum size is 50 MB.`);
+      setFileError(`File is too large (${formatBytes(f.size)}). Maximum size is 2 GB.`);
       return;
     }
     setFile(f);
-    setRoomId('');      // reset any previous room
+    setRoomId('');
     setSigError('');
   }, []);
 
@@ -69,7 +73,6 @@ export default function SenderPage() {
     const onRoomCreated = ({ roomId: id }) => {
       setRoomId(id);
       setIsCreating(false);
-      // Navigate to the room as sender; ReceiverPage will start the WebRTC flow
       navigate(`/r/${id}`, { state: { role: 'sender', file } });
     };
 
@@ -78,7 +81,7 @@ export default function SenderPage() {
       setIsCreating(false);
     };
 
-    socket.once('room-created', onRoomCreated);
+    socket.once('room-created',    onRoomCreated);
     socket.once('signaling-error', onError);
     socket.emit('create-room');
   }, [socketRef, file, navigate]);
@@ -100,6 +103,9 @@ export default function SenderPage() {
     : file.type === 'application/pdf' ? '📄'
     : '📦'
     : null;
+
+  // ── Large-file advisory ────────────────────────────────────────────────
+  const isLargeFile = file && file.size > 50 * 1024 * 1024;
 
   return (
     <div className="min-h-screen bg-gray-950 flex flex-col items-center justify-center px-4 py-12">
@@ -156,7 +162,7 @@ export default function SenderPage() {
                 <p className="text-sm text-gray-300">
                   <span className="font-medium text-white">Click to choose</span> or drag &amp; drop
                 </p>
-                <p className="text-xs text-gray-500 mt-1">Any file up to 50 MB</p>
+                <p className="text-xs text-gray-500 mt-1">Any file up to 2 GB</p>
               </div>
             </>
           )}
@@ -170,6 +176,14 @@ export default function SenderPage() {
           aria-hidden="true"
           onChange={(e) => pickFile(e.target.files?.[0])}
         />
+
+        {/* Large-file advisory */}
+        {isLargeFile && !fileError && (
+          <p className="text-xs text-yellow-400 flex items-center gap-1.5">
+            <span aria-hidden="true">⚠️</span>
+            Large file ({formatBytes(file.size)}) — both peers need to stay on the page until transfer completes.
+          </p>
+        )}
 
         {/* File validation error */}
         {fileError && (
@@ -208,7 +222,7 @@ export default function SenderPage() {
         </button>
       </div>
 
-      {/* ── Transfer details footer ──────────────────────────────────────── */}
+      {/* ── Footer ──────────────────────────────────────────────────────── */}
       <p className="mt-8 text-xs text-gray-600 text-center max-w-xs">
         Your file goes directly to the recipient's browser over an encrypted WebRTC channel.
         Nothing is stored on any server.

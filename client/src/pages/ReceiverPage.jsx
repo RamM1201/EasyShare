@@ -6,7 +6,8 @@
  *
  * - Sender:   joins the room as 'sender', waits for receiver, then sends the file.
  * - Receiver: joins the room as 'receiver', waits for the WebRTC data channel,
- *             then receives, verifies, and auto-downloads the file.
+ *             then receives, verifies, and auto-downloads the file via a
+ *             disk-backed chunk store (OPFS/IndexedDB, Stage 12).
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -87,6 +88,68 @@ function TransferProgress({ progress, bytesTransferred, totalBytes, speed, statu
   );
 }
 
+// ── Streaming download helper ────────────────────────────────────────────
+
+/**
+ * Stream the assembled file from a chunkStore to disk.
+ *
+ * Tries `showSaveFilePicker` (Chrome/Edge — no full in-memory buffer,
+ * native save dialog) first, then falls back to StreamSaver.js
+ * (cross-browser, no user gesture required for files < ~4 GB), and
+ * finally to a plain Blob download (works everywhere, but holds the
+ * whole file in memory — acceptable as a last resort for smaller files).
+ */
+async function streamDownload(store, metadata, totalChunks) {
+  const mimeType = metadata.mimeType || 'application/octet-stream';
+
+  // Option A — File System Access API (Chrome/Edge)
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      const fileHandle = await window.showSaveFilePicker({ suggestedName: metadata.name });
+      const writable = await fileHandle.createWritable();
+      for (let i = 0; i < totalChunks; i++) {
+        const buf = await store.read(i);
+        await writable.write(buf);
+      }
+      await writable.close();
+      return;
+    } catch (err) {
+      // AbortError = user cancelled the save dialog; don't fall back in that case.
+      if (err && err.name === 'AbortError') {
+        throw err;
+      }
+      // Otherwise (e.g. not supported in this context) fall through.
+    }
+  }
+
+  // Option B — StreamSaver.js (cross-browser)
+  try {
+    const { default: streamSaver } = await import('streamsaver');
+    const writeStream = streamSaver.createWriteStream(metadata.name, {
+      size: metadata.size,
+    });
+    const writer = writeStream.getWriter();
+    for (let i = 0; i < totalChunks; i++) {
+      const buf = await store.read(i);
+      await writer.write(new Uint8Array(buf));
+    }
+    await writer.close();
+    return;
+  } catch (err) {
+    console.warn('[ReceiverPage] StreamSaver unavailable, falling back to Blob download:', err);
+  }
+
+  // Option C — plain Blob fallback (loads the whole file into memory)
+  const allChunks = await store.readAll();
+  const blob = new Blob(allChunks, { type: mimeType });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = metadata.name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // ── Main page ────────────────────────────────────────────────────────────────
 
 export default function ReceiverPage() {
@@ -103,7 +166,7 @@ export default function ReceiverPage() {
   const [joinError,        setJoinError]         = useState('');
   const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [copyLabel,        setCopyLabel]         = useState('Copy link');
-  const [isHashing,        setIsHashing]         = useState(false);
+  const [downloadPhase,    setDownloadPhase]    = useState('idle'); // 'idle' | 'writing' | 'cleaning' | 'done'
 
   const hasJoinedRef   = useRef(false);
   const downloadedRef  = useRef(false);
@@ -179,12 +242,15 @@ export default function ReceiverPage() {
     totalBytes,
     transferSpeed,
     receivedMetadata,
-    receivedChunks,
+    totalChunks,
+    chunkStore,
+    storageKind,
     error: transferError,
   } = useFileTransfer({
     dataChannel,
     role:  isSender ? 'sender' : 'receiver',
     file:  fileToSend,
+    transferId: roomId,
   });
 
   // ── Derive connection badge status ────────────────────────────────────
@@ -217,26 +283,43 @@ export default function ReceiverPage() {
     }
   }, [peerLeft, status]);
 
-  // ── Auto-download when done (receiver only) ───────────────────────────
+  // ── Auto-download when done (receiver only) — streams from chunkStore ──
   useEffect(() => {
     if (isSender)                     return;
     if (status !== 'done')            return;
     if (downloadedRef.current)        return;
-    if (!receivedChunks.length)       return;
+    if (!chunkStore)                  return;
     if (!receivedMetadata)            return;
 
     downloadedRef.current = true;
 
-    const blob = new Blob(receivedChunks, {
-      type: receivedMetadata.mimeType || 'application/octet-stream',
-    });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href     = url;
-    a.download = receivedMetadata.name;
-    a.click();
-    URL.revokeObjectURL(url);
-  }, [isSender, status, receivedChunks, receivedMetadata]);
+    (async () => {
+      try {
+        setDownloadPhase('writing');
+        await streamDownload(chunkStore, receivedMetadata, totalChunks);
+        setDownloadPhase('cleaning');
+        await chunkStore.delete();
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          // User cancelled the save dialog — allow retry.
+          downloadedRef.current = false;
+          setDownloadPhase('idle');
+          return;
+        }
+        console.error('[ReceiverPage] Download error:', err);
+      } finally {
+        if (downloadedRef.current) {
+          setDownloadPhase('done');
+        }
+      }
+    })();
+  }, [isSender, status, chunkStore, receivedMetadata, totalChunks]);
+
+  // ── Manual retry for save-dialog cancellation ─────────────────────────
+  const handleRetryDownload = useCallback(() => {
+    downloadedRef.current = false;
+    setDownloadPhase('idle');
+  }, []);
 
   // ── Copy share link ───────────────────────────────────────────────────
   const handleCopy = useCallback(() => {
@@ -357,13 +440,43 @@ export default function ReceiverPage() {
               </p>
             )}
 
+            {/* Writing phase — IDB fallback path can be slow enough to show */}
+            {status === 'done' && !isSender && downloadPhase === 'writing' && (
+              <p className="text-xs text-center text-indigo-300 animate-pulse">
+                {storageKind === 'indexeddb'
+                  ? 'Preparing your download (this may take a moment)…'
+                  : 'Preparing your download…'}
+              </p>
+            )}
+
+            {/* Cleanup phase */}
+            {status === 'done' && !isSender && downloadPhase === 'cleaning' && (
+              <p className="text-xs text-center text-gray-400 animate-pulse">
+                Cleaning up temporary storage…
+              </p>
+            )}
+
             {/* Done: receiver */}
-            {status === 'done' && !isSender && (
+            {status === 'done' && !isSender && downloadPhase === 'done' && (
               <div className="bg-green-950/40 border border-green-800 rounded-xl p-4 text-center space-y-1">
                 <p className="text-sm font-semibold text-green-300">✅ Transfer complete</p>
                 <p className="text-xs text-green-400/80">
                   {receivedMetadata?.name} has been saved to your downloads.
                 </p>
+              </div>
+            )}
+
+            {/* Done but download was cancelled — offer retry */}
+            {status === 'done' && !isSender && downloadPhase === 'idle' && downloadedRef.current === false && (
+              <div className="bg-yellow-950/40 border border-yellow-800 rounded-xl p-4 text-center space-y-2">
+                <p className="text-sm font-semibold text-yellow-300">Download not started</p>
+                <p className="text-xs text-yellow-400/80">The save dialog was cancelled.</p>
+                <button
+                  onClick={handleRetryDownload}
+                  className="text-xs text-indigo-400 hover:text-indigo-300 underline underline-offset-2"
+                >
+                  Retry download
+                </button>
               </div>
             )}
 
