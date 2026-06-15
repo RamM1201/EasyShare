@@ -27,9 +27,6 @@ self.onmessage = event => {
   metadata[1] = data
   metadata[2] = port
 
-  // Note to self:
-  // old streamsaver v1.2.0 might still use `readableStream`...
-  // but v2.0.0 will always transfer the stream through MessageChannel #94
   if (event.data.readableStream) {
     metadata[0] = event.data.readableStream
   } else if (event.data.transferringReadable) {
@@ -46,10 +43,8 @@ self.onmessage = event => {
 }
 
 function createStream (port) {
-  // ReadableStream is only supported by chrome 52
   return new ReadableStream({
     start (controller) {
-      // When we receive data on the messageChannel, we write
       port.onmessage = ({ data }) => {
         if (data === 'end') {
           return controller.close()

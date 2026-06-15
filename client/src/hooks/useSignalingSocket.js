@@ -20,6 +20,7 @@ const SIGNALING_SERVER_URL =
 // same React tree shares exactly one socket connection.
 let _socket = null;
 
+// Return the shared Socket.io client instance.
 function getSocket() {
   if (!_socket) {
     _socket = io(SIGNALING_SERVER_URL, {
@@ -31,6 +32,7 @@ function getSocket() {
   return _socket;
 }
 
+// Bind the shared socket to this component tree.
 export function useSignalingSocket() {
   const socketRef = useRef(null);
 

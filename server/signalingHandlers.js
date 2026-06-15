@@ -1,9 +1,5 @@
 /**
  * Socket.io event handlers implementing EasyShare's signaling protocol.
- *
- * See SIGNALING_PROTOCOL.md at the repo root for the full event/payload
- * reference (written for whoever builds the Stage 3/4 frontend).
- *
  * IMPORTANT: this server only relays signaling messages (WebRTC offers,
  * answers, and ICE candidates) between exactly two peers in a room. It
  * never inspects, stores, or forwards any file data — that travels
@@ -95,7 +91,7 @@ export function registerSignalingHandlers(io, socket) {
 /**
  * Shared cleanup for both explicit "leave-room" and socket disconnects.
  * Notifies any remaining peer in the room so the UI can show a
- * disconnection message (Stage 8).
+ * disconnection message.
  */
 function handleLeave(io, socket) {
   const result = leaveRoom(socket.id);

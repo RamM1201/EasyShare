@@ -1,36 +1,12 @@
 /**
  * useFileTransfer.js
  *
- * KEY FIX (large-file hash mismatch):
- *
- * Root cause: handleMessage is async and was invoked concurrently for every
- * incoming DataChannel message event. With a 2.8 GB file (~11 200 chunks at
- * 256 KB) multiple processChunk() calls were in-flight simultaneously. This
- * caused two distinct bugs:
- *
- *  1. RACE on verifiedCountRef — the "all chunks done" guard fired while some
- *     store.write() promises were still pending, so flush()/read() ran before
- *     all bytes were written, producing a hash mismatch.
- *
- *  2. OPFS writable closed too early — OPFSChunkStore.read() calls flush()
- *     which closes the FileSystemWritableFileStream; any in-flight write()
- *     call arriving afterward silently failed or threw.
- *
- * Fix: a serial micro-queue (processQueue) guarantees that chunk processing
- * is strictly one-at-a-time. The DataChannel message handler enqueues work
- * and kicks the queue; the queue drains itself sequentially. This eliminates
- * both races with zero extra memory overhead.
- *
- * Everything else (incremental SHA-256, backpressure, OPFS/IDB store,
- * streaming download) is unchanged.
- *
- * ETA (added):
- *   Raw instantaneous speed is noisy. We smooth it with an exponential
- *   moving average (EMA) using α=0.15 — new samples have 15% weight,
- *   history has 85%. Samples are taken every 500 ms (unchanged). The
- *   raw speed is exposed as `transferSpeed` for the UI, while the
- *   smoothed speed is kept internally for `eta` (seconds remaining) and
- *   exported as `smoothedTransferSpeed` if callers need it.
+ * A React hook for peer-to-peer file transfer over WebRTC DataChannels.
+ * Features:
+  * - Incremental chunk hashing for integrity checks without full-file buffering.
+  * - Backpressure-aware sending to prevent overwhelming the DataChannel.
+  * - EMA-based transfer speed smoothing for stable ETA estimates.
+  * - Resilient receiver queue to handle out-of-order messages and async storage.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -41,6 +17,7 @@ export const CHUNK_SIZE = 256 * 1024; // 256 KB
 // ── Hashing helpers ──────────────────────────────────────────────────────────
 
 /** SHA-256 of an ArrayBuffer → lowercase hex string */
+// Hash a buffer to a hex SHA-256 string.
 async function sha256hex(buffer) {
   const hash = await crypto.subtle.digest('SHA-256', buffer);
   return Array.from(new Uint8Array(hash))
@@ -55,6 +32,7 @@ async function sha256hex(buffer) {
  * Both sender and receiver use this identically → consistent final value
  * without holding the whole file in RAM.
  */
+// Fold a chunk into the incremental file hash.
 async function updateRunningHash(prevHashHex, chunkBuffer) {
   const prevBytes = new Uint8Array(32);
   for (let i = 0; i < 32; i++) {
@@ -70,6 +48,7 @@ const INITIAL_HASH = '0'.repeat(64); // 32 zero bytes in hex
 
 // ── Misc helpers ─────────────────────────────────────────────────────────────
 
+// Read a file slice as an ArrayBuffer.
 function readSlice(file, start, end) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -79,6 +58,7 @@ function readSlice(file, start, end) {
   });
 }
 
+// Wait until the DataChannel buffer drains below a threshold.
 function waitForBufferDrain(dc, highWaterMark) {
   return new Promise((resolve) => {
     if (dc.bufferedAmount <= highWaterMark) { resolve(true); return; }
@@ -98,8 +78,6 @@ function waitForBufferDrain(dc, highWaterMark) {
 // ── EMA speed smoothing ───────────────────────────────────────────────────────
 //
 // α = 0.15 → strong smoothing; new sample contributes 15%, history 85%.
-// Raised slightly from a pure "last-interval" value so the ETA reacts
-// to genuine speed changes within a few seconds rather than tens of seconds.
 const EMA_ALPHA = 0.15;
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
@@ -118,12 +96,10 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
   const [error,            setError]            = useState(null);
   const [transferSpeed,    setTransferSpeed]    = useState(0);
   const [smoothedTransferSpeed, setSmoothedTransferSpeed] = useState(0);
-  // Smoothed ETA in seconds; null = not yet calculable
   const [eta,              setEta]              = useState(null);
 
   const lastSnapshotRef   = useRef({ bytes: 0, time: Date.now() });
-  // EMA state: smoothedSpeed is bytes/sec
-  const emaSpeedRef       = useRef(null); // null until first sample
+  const emaSpeedRef       = useRef(null);
   const metaRef           = useRef(null);
   const storeRef          = useRef(null);
   const isSendingRef      = useRef(false);
@@ -137,16 +113,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
   const fileHashRef        = useRef(null);
   const finalizeCalledRef  = useRef(false);
 
-  /**
-   * updateSpeed — called after every progress update.
-   *
-  * Computes the instantaneous speed over the last snapshot interval
-  * (≥ 500 ms), exposes it directly, feeds it into the EMA, then derives
-  * eta from the smoothed speed and remaining bytes.
-   *
-   * @param {number} totalBytesNow  — cumulative bytes transferred so far
-   * @param {number} fileSizeTotal  — total file size in bytes
-   */
+  // Update speed and ETA from the latest transfer snapshot.
   const updateSpeed = useCallback((totalBytesNow, fileSizeTotal) => {
     const now = Date.now();
     const { bytes: prevBytes, time: prevTime } = lastSnapshotRef.current;
@@ -183,6 +150,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
   useEffect(() => {
     if (role !== 'sender' || !dataChannel || !file) return;
 
+    // Stream the file in chunks over the data channel.
     const sendFile = async () => {
       if (isSendingRef.current) return;
       isSendingRef.current = true;
@@ -288,6 +256,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
     preStoreQueueRef.current  = [];
     emaSpeedRef.current       = null;
 
+    // Rebuild the full hash from stored chunks and compare it.
     const doFileHashVerify = async () => {
       if (finalizeCalledRef.current) return;
       finalizeCalledRef.current = true;
@@ -325,6 +294,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       setStatus('done');
     };
 
+    // Validate and persist one received chunk.
     const processChunkItem = async ({ header, binary }) => {
       const meta  = metaRef.current;
       const store = storeRef.current;
@@ -368,6 +338,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       }
     };
 
+    // Process queued receiver events in order.
     const drainQueue = async () => {
       if (queueRunningRef.current) return;
       queueRunningRef.current = true;
@@ -396,6 +367,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
 
     let pendingChunkHeader = null;
 
+    // Route incoming messages into metadata, chunk, or hash handling.
     const handleMessage = (event) => {
       if (typeof event.data === 'string') {
         let msg;

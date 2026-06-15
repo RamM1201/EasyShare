@@ -6,10 +6,6 @@
  * open a direct peer-to-peer connection. It never reads, stores, or
  * relays any actual file data — once the WebRTC data channel is open,
  * everything flows directly between browsers.
- *
- * - Room state management lives in ./rooms.js
- * - Socket.io event handlers live in ./signalingHandlers.js
- * - Full protocol reference: SIGNALING_PROTOCOL.md (repo root)
  */
 
 import express from 'express';
@@ -24,7 +20,7 @@ const PORT = process.env.PORT || 5000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || '*';
 
 const app = express();
-app.use(cors({ origin: CLIENT_ORIGIN }));
+app.use(cors({ origin: CLIENT_ORIGIN })); // Allow cross-origin requests from the client
 app.use(express.json());
 
 const httpServer = createServer(app);
@@ -37,7 +33,7 @@ const io = new Server(httpServer, {
 });
 
 // --- REST endpoints -------------------------------------------------
-
+// Root endpoint for basic server status check.
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -45,6 +41,7 @@ app.get('/', (req, res) => {
   });
 });
 
+// Health check endpoint for monitoring and load balancers.
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',

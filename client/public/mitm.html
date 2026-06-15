@@ -12,7 +12,6 @@
 	to open up a link that will start the download
 -->
 <script>
-// This will prevent the sw from restarting
 let keepAlive = () => {
   keepAlive = () => {}
   var ping = location.href.substr(0, location.href.lastIndexOf('/')) + '/ping'
@@ -56,7 +55,6 @@ function registerWorker() {
   })
 }
 
-// Now that we have the Service Worker registered we can process messages
 function onMessage (event) {
   let { data, ports, origin } = event
 
@@ -70,12 +68,8 @@ function onMessage (event) {
     throw new TypeError("[StreamSaver] You didn't send a object")
   }
 
-  // the default public service worker for StreamSaver is shared among others.
-  // so all download links needs to be prefixed to avoid any other conflict
   data.origin = origin
 
-  // if we ever (in some feature versoin of streamsaver) would like to
-  // redirect back to the page of who initiated a http request
   data.referrer = data.referrer || document.referrer || origin
 
   // pass along version for possible backwards compatibility in sw.js
@@ -147,8 +141,6 @@ function onMessage (event) {
 }
 
 if (window.opener) {
-  // The opener can't listen to onload event, so we need to help em out!
-  // (telling them that we are ready to accept postMessage's)
   window.opener.postMessage('StreamSaver::loadedPopup', '*')
 }
 
@@ -158,8 +150,6 @@ if (navigator.serviceWorker) {
     messages.forEach(window.onmessage)
   })
 } else {
-  // FF can ping sw with fetch from a secure hidden iframe
-  // shouldn't really be possible?
   keepAlive()
 }
 

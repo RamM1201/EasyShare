@@ -4,14 +4,12 @@
  * Home page — drag-and-drop file selection, room creation, and share-link display.
  * After creating a room the sender navigates to /r/:roomId with role='sender'.
  *
- * Stage 12: file size limit raised to 2 GB (large-file support via OPFS/IDB).
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import useSignalingSocket from '../hooks/useSignalingSocket';
 
-// Stage 12: raise to 10 GB — the UI will warn; actual limit is browser RAM/storage
 const MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024; // 10 GB
 
 /** Format bytes to a human-readable string. */
@@ -23,6 +21,7 @@ function formatBytes(bytes) {
 }
 
 export default function SenderPage() {
+  // Render the file picker and room creation page.
   const navigate   = useNavigate();
   const socketRef  = useSignalingSocket();
 
@@ -39,7 +38,7 @@ export default function SenderPage() {
     ? `${window.location.origin}/r/${roomId}`
     : '';
 
-  // ── Validate and set file ──────────────────────────────────────────────
+  // Validate a selected file and reset transfer state.
   const pickFile = useCallback((f) => {
     setFileError('');
     if (!f) return;
@@ -53,8 +52,11 @@ export default function SenderPage() {
   }, []);
 
   // ── Drag-and-drop handlers ─────────────────────────────────────────────
+  // Keep drag state active while a file is over the drop zone.
   const onDragOver  = (e) => { e.preventDefault(); setIsDragging(true); };
+  // Clear drag state when the pointer leaves the drop zone.
   const onDragLeave = ()  => setIsDragging(false);
+  // Accept a dropped file and hand it off to the picker logic.
   const onDrop      = (e) => {
     e.preventDefault();
     setIsDragging(false);
@@ -63,6 +65,7 @@ export default function SenderPage() {
   };
 
   // ── Create room ────────────────────────────────────────────────────────
+  // Create a signaling room and navigate to the sender view.
   const handleCreateRoom = useCallback(() => {
     const socket = socketRef.current;
     if (!socket || !file) return;
@@ -87,6 +90,7 @@ export default function SenderPage() {
   }, [socketRef, file, navigate]);
 
   // ── Copy link ──────────────────────────────────────────────────────────
+  // Copy the share link to the clipboard.
   const handleCopy = useCallback(() => {
     if (!shareUrl) return;
     navigator.clipboard.writeText(shareUrl).then(() => {
@@ -96,6 +100,7 @@ export default function SenderPage() {
   }, [shareUrl]);
 
   // ── File icon based on MIME ────────────────────────────────────────────
+  // Pick a simple emoji icon based on the file type.
   const fileIcon = file
     ? file.type.startsWith('image/') ? '🖼️'
     : file.type.startsWith('video/') ? '🎬'
@@ -105,6 +110,7 @@ export default function SenderPage() {
     : null;
 
   // ── Large-file advisory ────────────────────────────────────────────────
+  // Flag files that may take longer to keep both peers on the page.
   const isLargeFile = file && file.size > 50 * 1024 * 1024;
 
   return (
@@ -231,6 +237,7 @@ export default function SenderPage() {
   );
 }
 
+// Show a compact loading spinner.
 function SpinnerIcon() {
   return (
     <svg

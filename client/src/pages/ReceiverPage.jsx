@@ -17,6 +17,7 @@ import useWebRTC from '../hooks/useWebRTC';
 import useFileTransfer from '../hooks/useFileTransfer';
 
 /** Format bytes to a human-readable string. */
+// Format raw byte counts for display.
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -24,6 +25,7 @@ function formatBytes(bytes) {
 }
 
 /** Format bytes/sec to MB/s or KB/s string. */
+// Format transfer speed for display.
 function formatSpeed(bps) {
   if (bps <= 0) return '—';
   if (bps >= 1024 * 1024) return `${(bps / (1024 * 1024)).toFixed(1)} MB/s`;
@@ -32,11 +34,8 @@ function formatSpeed(bps) {
 
 /**
  * Format seconds into a compact, human-friendly ETA string.
- *
- * Examples:  3 → "3s"   75 → "1m 15s"   3700 → "1h 1m"
- * We drop the seconds component once the estimate exceeds a minute —
- * showing "1m 15s" is useful, but "1h 1m 3s" adds false precision.
  */
+// Format an ETA in compact, human-readable form.
 function formatETA(seconds) {
   if (seconds == null || seconds <= 0) return null;
   const s = Math.round(seconds);
@@ -52,13 +51,13 @@ function formatETA(seconds) {
 // ── ConnectionBadge ──────────────────────────────────────────────────────────
 
 const BADGE_CONFIG = {
-  connecting:   { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Connecting…' },
-  waiting:      { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Waiting for peer…' },
-  connected:    { dot: 'bg-green-400',                text: 'text-green-300',  label: 'Connected' },
-  interrupted:  { dot: 'bg-orange-400',               text: 'text-orange-300', label: 'Transfer interrupted' },
-  disconnected: { dot: 'bg-red-400',                  text: 'text-red-300',    label: 'Disconnected' },
-  error:        { dot: 'bg-red-400',                  text: 'text-red-300',    label: 'Error' },
-  done:         { dot: 'bg-green-400',                text: 'text-green-300',  label: 'Transfer complete' },
+  connecting: { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Connecting…' },
+  waiting: { dot: 'bg-yellow-400 animate-pulse', text: 'text-yellow-300', label: 'Waiting for peer…' },
+  connected: { dot: 'bg-green-400', text: 'text-green-300', label: 'Connected' },
+  interrupted: { dot: 'bg-orange-400', text: 'text-orange-300', label: 'Transfer interrupted' },
+  disconnected: { dot: 'bg-red-400', text: 'text-red-300', label: 'Disconnected' },
+  error: { dot: 'bg-red-400', text: 'text-red-300', label: 'Error' },
+  done: { dot: 'bg-green-400', text: 'text-green-300', label: 'Transfer complete' },
 };
 
 function ConnectionBadge({ status }) {
@@ -73,6 +72,7 @@ function ConnectionBadge({ status }) {
 
 // ── TransferProgress ─────────────────────────────────────────────────────────
 
+// Render progress, speed, and ETA for the current transfer.
 function TransferProgress({ progress, bytesTransferred, totalBytes, speed, eta, status }) {
   const isDone = status === 'done';
   const isActive = !isDone && status === 'transferring';
@@ -191,6 +191,7 @@ async function streamDownload(store, metadata, totalChunks) {
 
 // ── Main page ────────────────────────────────────────────────────────────────
 
+// Render the sender/receiver transfer page.
 export default function ReceiverPage() {
   const { roomId } = useParams();
   const location = useLocation();
@@ -206,7 +207,7 @@ export default function ReceiverPage() {
   const [copyLabel, setCopyLabel] = useState('Copy link');
   const [downloadPhase, setDownloadPhase] = useState('idle');
 
-  const hasJoinedRef  = useRef(false);
+  const hasJoinedRef = useRef(false);
   const downloadedRef = useRef(false);
 
   const shareUrl = `${window.location.origin}/r/${roomId}`;
@@ -343,12 +344,14 @@ export default function ReceiverPage() {
   }, [isSender, status, chunkStore, receivedMetadata, totalChunks]);
 
   // ── Manual retry ──────────────────────────────────────────────────────
+  // Reset the download state so the user can retry.
   const handleRetryDownload = useCallback(() => {
     downloadedRef.current = false;
     setDownloadPhase('idle');
   }, []);
 
   // ── Copy share link ───────────────────────────────────────────────────
+  // Copy the share link to the clipboard.
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(shareUrl).then(() => {
       setCopyLabel('Copied!');
@@ -557,6 +560,7 @@ export default function ReceiverPage() {
   );
 }
 
+// Show a small pulsing waiting indicator.
 function PulseIcon() {
   return (
     <svg className="w-8 h-8 text-indigo-500 animate-pulse" fill="none" viewBox="0 0 24 24">

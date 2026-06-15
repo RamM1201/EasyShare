@@ -4,8 +4,7 @@
  * A "room" represents a single file-transfer session. For the MVP, a room
  * holds at most MAX_PEERS_PER_ROOM peers (the sender who created it, and
  * one receiver who joins via the share link). Supporting more peers per
- * room (mesh swarming) is a planned optional extension — see
- * PROJECT_ROADMAP.md, Stage 11.
+ * room (mesh swarming) is a planned optional extension
  *
  * Room data lives only in memory. If the server restarts, all rooms are
  * lost — this is fine because rooms are short-lived signaling sessions,

@@ -33,7 +33,7 @@ export default function useWebRTC({ socket, role, peerId }) {
   const [error, setError]                       = useState(null);
   const [peerLeft, setPeerLeft]                 = useState(false);
 
-  /** Tear down the peer connection cleanly. */
+  // Tear down the peer connection cleanly.
   const closePC = useCallback(() => {
     if (pcRef.current) {
       pcRef.current.onconnectionstatechange = null;
@@ -102,6 +102,7 @@ export default function useWebRTC({ socket, role, peerId }) {
     }
 
     // ── Incoming signaling messages ───────────────────────────────────────
+    // Handle incoming signaling messages for this peer.
     const handleSignal = async ({ from, data }) => {
       if (from !== peerId) return;
 
@@ -128,6 +129,7 @@ export default function useWebRTC({ socket, role, peerId }) {
     socket.on('signal', handleSignal);
 
     // ── Peer-left: close the connection immediately ───────────────────────
+    // Close the connection when the remote peer leaves.
     const handlePeerLeft = () => {
       setPeerLeft(true);
       closePC();
