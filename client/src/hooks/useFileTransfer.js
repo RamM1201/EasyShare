@@ -1,24 +1,28 @@
 /**
- * useFileTransfer.js  —  Stage 12 (large-file fix)
+ * useFileTransfer.js
  *
- * Sender changes:
- *   - No longer accumulates allChunkBuffers[].  RAM usage is O(1) per chunk.
- *   - Full-file SHA-256 is computed incrementally using a running
- *     DigestStream shim (XOR-chained hashes).  Because SubtleCrypto has no
- *     streaming API, we use a well-known incremental approach: we maintain a
- *     running "combined hash" by hashing (prev_hash_bytes || chunk_bytes)
- *     after each chunk.  This is NOT the same value as hashing the whole
- *     file in one shot, so the receiver uses the same algorithm to verify.
+ * KEY FIX (large-file hash mismatch):
  *
- *   ⚠  If you need byte-identical SHA-256 of the concatenated file you would
- *      need a Web Worker + WASM hash library (e.g. hash-wasm).  The
- *      incremental approach here gives equally strong tamper-detection with
- *      zero extra RAM on the sender.
+ * Root cause: handleMessage is async and was invoked concurrently for every
+ * incoming DataChannel message event. With a 2.8 GB file (~11 200 chunks at
+ * 256 KB) multiple processChunk() calls were in-flight simultaneously. This
+ * caused two distinct bugs:
  *
- * Receiver changes:
- *   - doFileHashVerify() reads chunks one at a time from the store and
- *     recomputes the same incremental hash instead of loading the whole
- *     file into a single ArrayBuffer.  RAM usage is O(1) per chunk.
+ *  1. RACE on verifiedCountRef — the "all chunks done" guard fired while some
+ *     store.write() promises were still pending, so flush()/read() ran before
+ *     all bytes were written, producing a hash mismatch.
+ *
+ *  2. OPFS writable closed too early — OPFSChunkStore.read() calls flush()
+ *     which closes the FileSystemWritableFileStream; any in-flight write()
+ *     call arriving afterward silently failed or threw.
+ *
+ * Fix: a serial micro-queue (processQueue) guarantees that chunk processing
+ * is strictly one-at-a-time. The DataChannel message handler enqueues work
+ * and kicks the queue; the queue drains itself sequentially. This eliminates
+ * both races with zero extra memory overhead.
+ *
+ * Everything else (incremental SHA-256, backpressure, OPFS/IDB store,
+ * streaming download) is unchanged.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -37,21 +41,17 @@ async function sha256hex(buffer) {
 }
 
 /**
- * Incremental "running hash":  H_n = SHA-256( H_{n-1}_bytes || chunk_bytes )
+ * Incremental "running hash": H_n = SHA-256( H_{n-1}_bytes || chunk_bytes )
  *
- * Starts with a zero-filled 32-byte seed so the first step is effectively
- * SHA-256( 0x00…00 || chunk_0 ).
- *
- * Both sender and receiver use this function identically, so the final value
- * is always consistent without holding the full file in RAM.
+ * Starts from a 32-byte zero seed, so H_0 = SHA-256(0x00…00 || chunk_0).
+ * Both sender and receiver use this identically → consistent final value
+ * without holding the whole file in RAM.
  */
 async function updateRunningHash(prevHashHex, chunkBuffer) {
-  // Convert previous hex hash to bytes
   const prevBytes = new Uint8Array(32);
   for (let i = 0; i < 32; i++) {
     prevBytes[i] = parseInt(prevHashHex.slice(i * 2, i * 2 + 2), 16);
   }
-  // Concatenate prev-hash bytes + chunk bytes
   const combined = new Uint8Array(32 + chunkBuffer.byteLength);
   combined.set(prevBytes, 0);
   combined.set(new Uint8Array(chunkBuffer), 32);
@@ -74,7 +74,7 @@ function readSlice(file, start, end) {
 function waitForBufferDrain(dc, highWaterMark) {
   return new Promise((resolve) => {
     if (dc.bufferedAmount <= highWaterMark) { resolve(true); return; }
-    const onLow = () => { cleanup(); resolve(true); };
+    const onLow   = () => { cleanup(); resolve(true); };
     const onClose = () => { cleanup(); resolve(false); };
     function cleanup() {
       dc.removeEventListener('bufferedamountlow', onLow);
@@ -90,26 +90,35 @@ function waitForBufferDrain(dc, highWaterMark) {
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 export default function useFileTransfer({ dataChannel, role, file, transferId }) {
-  const [status, setStatus] = useState('idle');
-  const [progress, setProgress] = useState(0);
+  const [status,           setStatus]           = useState('idle');
+  const [progress,         setProgress]         = useState(0);
   const [bytesTransferred, setBytesTransferred] = useState(0);
-  const [totalBytes, setTotalBytes] = useState(0);
-  const [chunksReceived, setChunksReceived] = useState(0);
-  const [totalChunks, setTotalChunks] = useState(0);
+  const [totalBytes,       setTotalBytes]       = useState(0);
+  const [chunksReceived,   setChunksReceived]   = useState(0);
+  const [totalChunks,      setTotalChunks]      = useState(0);
   const [receivedMetadata, setReceivedMetadata] = useState(null);
-  const [receivedChunks] = useState(null); // always null
-  const [chunkStore, setChunkStore] = useState(null);
-  const [storageKind, setStorageKind] = useState(null);
-  const [error, setError] = useState(null);
-  const [transferSpeed, setTransferSpeed] = useState(0);
+  const [receivedChunks]                        = useState(null); // always null
+  const [chunkStore,       setChunkStore]       = useState(null);
+  const [storageKind,      setStorageKind]      = useState(null);
+  const [error,            setError]            = useState(null);
+  const [transferSpeed,    setTransferSpeed]    = useState(0);
 
-  const lastSnapshotRef = useRef({ bytes: 0, time: Date.now() });
-  const metaRef = useRef(null);
-  const storeRef = useRef(null);
-  const isSendingRef = useRef(false);
-  const chunkIdxRef = useRef(0);
-  const verifiedCountRef = useRef(0);
-  const pendingChunksRef = useRef([]);
+  const lastSnapshotRef   = useRef({ bytes: 0, time: Date.now() });
+  const metaRef           = useRef(null);
+  const storeRef          = useRef(null);
+  const isSendingRef      = useRef(false);
+  const verifiedCountRef  = useRef(0);
+
+  // ── Serial queue state (receiver) ─────────────────────────────────────
+  // pendingItemsRef holds { type: 'chunk', header, binary } | { type: 'filehash', hash }
+  // queueRunningRef prevents concurrent drains
+  const pendingItemsRef  = useRef([]);
+  const queueRunningRef  = useRef(false);
+  // items that arrived before metadata/store were ready
+  const preStoreQueueRef = useRef([]);
+
+  const fileHashRef        = useRef(null);
+  const finalizeCalledRef  = useRef(false);
 
   const updateSpeed = useCallback((totalBytesNow) => {
     const now = Date.now();
@@ -141,7 +150,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         const numChunks = Math.ceil(file.size / CHUNK_SIZE);
         setTotalChunks(numChunks);
 
-        // Lightweight metadata — no upfront chunk hashes
         const metadata = {
           type: 'metadata',
           name: file.name,
@@ -149,7 +157,7 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           mimeType: file.type || 'application/octet-stream',
           totalChunks: numChunks,
           chunkSize: CHUNK_SIZE,
-          hashAlgo: 'incremental-sha256', // signals receiver to use same algo
+          hashAlgo: 'incremental-sha256',
         };
 
         if (dataChannel.readyState !== 'open') {
@@ -157,21 +165,17 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         }
         dataChannel.send(JSON.stringify(metadata));
 
-        let bytesSent = 0;
-        let runningHash = INITIAL_HASH; // incremental full-file hash — O(1) RAM
+        let bytesSent    = 0;
+        let runningHash  = INITIAL_HASH;
 
         for (let i = 0; i < numChunks; i++) {
           const start = i * CHUNK_SIZE;
-          const end = Math.min(start + CHUNK_SIZE, file.size);
+          const end   = Math.min(start + CHUNK_SIZE, file.size);
           const chunk = await readSlice(file, start, end);
 
-          // Per-chunk hash (for immediate tamper detection on the receiver)
           const chunkHash = await sha256hex(chunk);
+          runningHash     = await updateRunningHash(runningHash, chunk);
 
-          // Update running full-file hash — NO buffer accumulation
-          runningHash = await updateRunningHash(runningHash, chunk);
-
-          // Backpressure
           if (dataChannel.bufferedAmount > HIGH_WATER) {
             const ok = await waitForBufferDrain(dataChannel, HIGH_WATER / 2);
             if (!ok || dataChannel.readyState !== 'open') {
@@ -179,7 +183,6 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
             }
           }
 
-          // Send header then binary
           const header = JSON.stringify({ type: 'chunk', index: i, hash: chunkHash });
           try {
             dataChannel.send(header);
@@ -193,11 +196,9 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           setProgress(Math.round((bytesSent / file.size) * 100));
           updateSpeed(bytesSent);
 
-          // Yield to event loop every 20 chunks
           if (i % 20 === 0) await new Promise((r) => setTimeout(r, 0));
         }
 
-        // Send incremental full-file hash as footer
         if (dataChannel.readyState !== 'open') {
           throw new Error('Connection lost before sending file hash.');
         }
@@ -225,66 +226,37 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
   useEffect(() => {
     if (role !== 'receiver' || !dataChannel) return;
 
-    chunkIdxRef.current = 0;
-    verifiedCountRef.current = 0;
-    pendingChunksRef.current = [];
+    // Reset all receiver state
+    verifiedCountRef.current  = 0;
+    finalizeCalledRef.current = false;
+    fileHashRef.current       = null;
+    pendingItemsRef.current   = [];
+    queueRunningRef.current   = false;
+    preStoreQueueRef.current  = [];
 
-    const processChunk = async (idx, chunk) => {
-      const meta = metaRef.current;
-      const store = storeRef.current;
-      if (!meta || !store) return;
-
-      try {
-        await store.write(idx, chunk);
-      } catch (err) {
-        console.error('[FileTransfer] chunkStore write error:', err);
-        setError('Failed to write chunk to local storage.');
-        setStatus('error');
-        return;
-      }
-
-      const verified = ++verifiedCountRef.current;
-      const bytesNow = Math.min(verified * meta.chunkSize, meta.size);
-
-      setChunksReceived(verified);
-      setBytesTransferred(bytesNow);
-      setProgress(Math.round((verified / meta.totalChunks) * 100));
-      updateSpeed(bytesNow);
-
-      if (verified === meta.totalChunks) {
-        setStatus('verifying');
-        setTransferSpeed(0);
-        if (store.flush) {
-          try { await store.flush(); } catch { /* no-op */ }
-        }
-        // If the filehash footer already arrived, verify now
-        if (fileHashRef.current !== null) {
-          await doFileHashVerify();
-        }
-      }
-    };
-
-    const fileHashRef = { current: null };
-    const finalizeCalledRef = { current: false };
-
-    /**
-     * Verify full-file integrity using the same incremental SHA-256 as the
-     * sender — reads one chunk at a time from the store, O(1) RAM.
-     */
+    // ── Full-file integrity verification ──────────────────────────────────
+    // Called only after ALL chunks have been written AND the filehash footer
+    // has arrived. The serial queue ensures no writes are in-flight here.
     const doFileHashVerify = async () => {
       if (finalizeCalledRef.current) return;
       finalizeCalledRef.current = true;
 
-      const meta = metaRef.current;
+      const meta  = metaRef.current;
       const store = storeRef.current;
       if (!meta || !store) return;
+
+      // Close the OPFS writable before reading back
+      if (store.flush) {
+        try { await store.flush(); } catch { /* no-op */ }
+      }
 
       try {
         let runningHash = INITIAL_HASH;
         for (let i = 0; i < meta.totalChunks; i++) {
           const chunk = await store.read(i);
           runningHash = await updateRunningHash(runningHash, chunk);
-          if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
+          // Yield every 50 chunks to avoid blocking the main thread
+          if (i % 50 === 0) await new Promise((r) => setTimeout(r, 0));
         }
 
         if (runningHash !== fileHashRef.current) {
@@ -303,10 +275,90 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
       setStatus('done');
     };
 
+    // ── Process one chunk item (called only from drainQueue) ───────────────
+    // Guaranteed to run serially — no concurrent invocations.
+    const processChunkItem = async ({ header, binary }) => {
+      const meta  = metaRef.current;
+      const store = storeRef.current;
+      if (!meta || !store) return;
+
+      const idx   = header.index;
+      const chunk = binary; // ArrayBuffer
+
+      // Per-chunk integrity check
+      const hash = await sha256hex(chunk);
+      if (hash !== header.hash) {
+        setError(`Chunk ${idx + 1} failed integrity check. File may be corrupted.`);
+        setStatus('error');
+        return;
+      }
+
+      try {
+        await store.write(idx, chunk);
+      } catch (err) {
+        console.error('[FileTransfer] chunkStore write error:', err);
+        setError('Failed to write chunk to local storage.');
+        setStatus('error');
+        return;
+      }
+
+      const verified   = ++verifiedCountRef.current;
+      const bytesNow   = Math.min(verified * meta.chunkSize, meta.size);
+
+      setChunksReceived(verified);
+      setBytesTransferred(bytesNow);
+      setProgress(Math.round((verified / meta.totalChunks) * 100));
+      updateSpeed(bytesNow);
+
+      // All chunks written — check if we can finalize
+      if (verified === meta.totalChunks) {
+        setStatus('verifying');
+        setTransferSpeed(0);
+        // If filehash footer already arrived, verify now.
+        // Otherwise doFileHashVerify will be called when the footer arrives
+        // (also via the serial queue, so no race).
+        if (fileHashRef.current !== null) {
+          await doFileHashVerify();
+        }
+      }
+    };
+
+    // ── Serial queue drain ─────────────────────────────────────────────────
+    // Ensures processChunkItem and doFileHashVerify are never concurrent.
+    const drainQueue = async () => {
+      if (queueRunningRef.current) return; // already draining
+      queueRunningRef.current = true;
+
+      while (pendingItemsRef.current.length > 0) {
+        const item = pendingItemsRef.current.shift();
+        try {
+          if (item.type === 'chunk') {
+            await processChunkItem(item);
+          } else if (item.type === 'filehash') {
+            fileHashRef.current = item.hash;
+            const meta = metaRef.current;
+            if (meta && verifiedCountRef.current === meta.totalChunks) {
+              await doFileHashVerify();
+            }
+            // else: doFileHashVerify will be triggered after the last chunk
+          }
+        } catch (err) {
+          console.error('[FileTransfer] Queue processing error:', err);
+          setError('Unexpected error during transfer.');
+          setStatus('error');
+        }
+      }
+
+      queueRunningRef.current = false;
+    };
+
+    // ── DataChannel message handler ────────────────────────────────────────
+    // Lightweight: just parse/buffer, then kick the queue.
+    // Never awaits anything itself so it returns immediately and never races.
     let pendingChunkHeader = null;
 
-    const handleMessage = async (event) => {
-      // ── Text (metadata / chunk header / filehash) ──
+    const handleMessage = (event) => {
+      // ── Text: metadata / chunk header / filehash ──────────────────────
       if (typeof event.data === 'string') {
         let msg;
         try { msg = JSON.parse(event.data); } catch { return; }
@@ -319,23 +371,24 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
           setStatus('transferring');
           lastSnapshotRef.current = { bytes: 0, time: Date.now() };
 
-          try {
-            const id = transferId || 'transfer';
-            const store = await createChunkStore(id, msg.totalChunks, msg.chunkSize || CHUNK_SIZE);
-            storeRef.current = store;
-            setChunkStore(store);
-            setStorageKind(store.kind);
+          // Initialise the chunk store asynchronously, then drain pre-store queue
+          const id = transferId || 'transfer';
+          createChunkStore(id, msg.totalChunks, msg.chunkSize || CHUNK_SIZE)
+            .then((store) => {
+              storeRef.current = store;
+              setChunkStore(store);
+              setStorageKind(store.kind);
 
-            // Drain any chunks that arrived before the store was ready
-            const pending = pendingChunksRef.current.splice(0);
-            for (const { idx, chunk } of pending) {
-              await processChunk(idx, chunk);
-            }
-          } catch (err) {
-            console.error('[FileTransfer] Store init error:', err);
-            setError('Failed to initialize local storage for transfer.');
-            setStatus('error');
-          }
+              // Enqueue anything that arrived before the store was ready
+              const pre = preStoreQueueRef.current.splice(0);
+              pendingItemsRef.current.push(...pre);
+              drainQueue();
+            })
+            .catch((err) => {
+              console.error('[FileTransfer] Store init error:', err);
+              setError('Failed to initialise local storage for transfer.');
+              setStatus('error');
+            });
           return;
         }
 
@@ -345,10 +398,13 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         }
 
         if (msg.type === 'filehash') {
-          fileHashRef.current = msg.hash;
-          const meta = metaRef.current;
-          if (meta && verifiedCountRef.current === meta.totalChunks) {
-            await doFileHashVerify();
+          // Enqueue so it's processed after any in-flight chunk items
+          const item = { type: 'filehash', hash: msg.hash };
+          if (!storeRef.current) {
+            preStoreQueueRef.current.push(item);
+          } else {
+            pendingItemsRef.current.push(item);
+            drainQueue();
           }
           return;
         }
@@ -356,30 +412,22 @@ export default function useFileTransfer({ dataChannel, role, file, transferId })
         return;
       }
 
-      // ── Binary (chunk payload) ──
+      // ── Binary: chunk payload ──────────────────────────────────────────
       if (!(event.data instanceof ArrayBuffer)) return;
 
       const header = pendingChunkHeader;
       pendingChunkHeader = null;
       if (!header) return;
 
-      const chunk = event.data;
-      const idx = header.index;
-
-      // Per-chunk integrity check
-      const hash = await sha256hex(chunk);
-      if (hash !== header.hash) {
-        setError(`Chunk ${idx + 1} failed integrity check. File may be corrupted.`);
-        setStatus('error');
-        return;
-      }
+      const item = { type: 'chunk', header, binary: event.data };
 
       if (!storeRef.current) {
-        pendingChunksRef.current.push({ idx, chunk });
-        return;
+        // Store not ready yet — buffer until it is
+        preStoreQueueRef.current.push(item);
+      } else {
+        pendingItemsRef.current.push(item);
+        drainQueue();
       }
-
-      await processChunk(idx, chunk);
     };
 
     dataChannel.addEventListener('message', handleMessage);

@@ -1,16 +1,20 @@
 /**
- * chunkStore.js  —  Stage 12 (large-file fix)
+ * chunkStore.js
  *
  * Two backends:
  *   OPFSChunkStore   — keeps a single FileSystemWritableFileStream open for
  *                      the lifetime of the transfer, writing each chunk to
- *                      disk immediately at the correct byte offset.
- *                      RAM usage: O(1) per chunk, not O(n).
- *   IDBChunkStore    — unchanged; IDB already persists per-transaction.
+ *                      disk at the correct byte offset. RAM usage: O(1).
+ *   IDBChunkStore    — IndexedDB fallback. Already persists per-transaction.
  *
- * The `read(index)` method on OPFS re-reads from disk so that
- * ReceiverPage can stream the download chunk-by-chunk without holding
- * everything in memory.
+ * FIXES vs. original:
+ *  - OPFSChunkStore.read() no longer calls flush() internally. The caller
+ *    (useFileTransfer → doFileHashVerify) is now responsible for calling
+ *    flush() exactly once before any read() calls. This prevents the
+ *    writable being closed mid-transfer when read() was called from the
+ *    serial queue while writes were still pending.
+ *  - flush() is idempotent and safe to call multiple times.
+ *  - readAll() likewise does not call flush().
  */
 
 const CHUNK_SIZE_DEFAULT = 256 * 1024; // must match useFileTransfer.CHUNK_SIZE
@@ -20,9 +24,9 @@ const CHUNK_SIZE_DEFAULT = 256 * 1024; // must match useFileTransfer.CHUNK_SIZE
 async function opfsAvailable() {
   try {
     if (!navigator?.storage?.getDirectory) return false;
-    const root = await navigator.storage.getDirectory();
+    const root       = await navigator.storage.getDirectory();
     const testHandle = await root.getFileHandle('_easyshare_test', { create: true });
-    const writable = await testHandle.createWritable();
+    const writable   = await testHandle.createWritable();
     await writable.close();
     await root.removeEntry('_easyshare_test');
     return true;
@@ -34,74 +38,72 @@ async function opfsAvailable() {
 // ── OPFS implementation ──────────────────────────────────────────────────────
 
 class OPFSChunkStore {
-  /**
-   * @param {FileSystemDirectoryHandle} root
-   * @param {FileSystemFileHandle}      fileHandle
-   * @param {FileSystemWritableFileStream} writable  — kept open until flush()/delete()
-   * @param {number} chunkSize
-   * @param {number} totalChunks
-   */
   constructor(root, fileHandle, writable, chunkSize, totalChunks) {
     this.root        = root;
     this.fileHandle  = fileHandle;
-    this._writable   = writable;   // single stream, kept open
+    this._writable   = writable;
     this.chunkSize   = chunkSize;
     this.totalChunks = totalChunks;
     this._closed     = false;
+    this._fileCache  = null; // cached File object after flush
   }
 
   static async create(transferId, totalChunks, chunkSize) {
     const root       = await navigator.storage.getDirectory();
     const fileName   = `easyshare-${transferId}.bin`;
     const fileHandle = await root.getFileHandle(fileName, { create: true });
-
-    // Open once; we'll seek to the right offset for each chunk.
-    // { keepExistingData: false } truncates any leftover from a previous attempt.
-    const writable = await fileHandle.createWritable({ keepExistingData: false });
-
+    const writable   = await fileHandle.createWritable({ keepExistingData: false });
     return new OPFSChunkStore(root, fileHandle, writable, chunkSize, totalChunks);
   }
 
-  /** Write chunk at its exact byte position — O(1) RAM. */
+  /** Write chunk at its exact byte position. Must be called before flush(). */
   async write(index, arrayBuffer) {
-    if (this._closed) throw new Error('OPFSChunkStore: already closed');
+    if (this._closed) throw new Error('OPFSChunkStore: already flushed — cannot write');
     const offset = index * this.chunkSize;
     await this._writable.seek(offset);
     await this._writable.write(arrayBuffer);
   }
 
-  /** Read one chunk back from disk for streaming download. */
-  async read(index) {
-    // flush() must be called before read() — writable must be closed first.
-  if (!this._closed) {
-    await this.flush();
-  }
-  const file   = await this.fileHandle.getFile();
-  const start  = index * this.chunkSize;
-  const end    = Math.min(start + this.chunkSize, file.size);
-  return file.slice(start, end).arrayBuffer();
-  }
-
-  /** Read all chunks sequentially — used by the Blob fallback path. */
-  async readAll() {
-    if (!this._closed) {
-    await this.flush();
-  }
-  const file   = await this.fileHandle.getFile();
-  const chunks = [];
-  for (let i = 0; i < this.totalChunks; i++) {
-    const start = i * this.chunkSize;
-    const end   = Math.min(start + this.chunkSize, file.size);
-    chunks.push(await file.slice(start, end).arrayBuffer());
-  }
-  return chunks;
-  }
-
-  /** Close the writable stream — must be called before read() or delete(). */
+  /**
+   * Close the writable stream.
+   * MUST be called before any read() or readAll() calls.
+   * Safe to call multiple times (idempotent).
+   */
   async flush() {
     if (this._closed) return;
-    this._closed = true;
+    this._closed  = true;
     await this._writable.close();
+    // Cache the File object so read() doesn't open it repeatedly
+    this._fileCache = await this.fileHandle.getFile();
+  }
+
+  /**
+   * Read one chunk from disk.
+   * Requires flush() to have been called first.
+   */
+  async read(index) {
+    if (!this._closed) {
+      throw new Error('OPFSChunkStore: flush() must be called before read()');
+    }
+    const file  = this._fileCache || (this._fileCache = await this.fileHandle.getFile());
+    const start = index * this.chunkSize;
+    const end   = Math.min(start + this.chunkSize, file.size);
+    return file.slice(start, end).arrayBuffer();
+  }
+
+  /** Read all chunks sequentially. Requires flush() to have been called first. */
+  async readAll() {
+    if (!this._closed) {
+      throw new Error('OPFSChunkStore: flush() must be called before readAll()');
+    }
+    const file   = this._fileCache || (this._fileCache = await this.fileHandle.getFile());
+    const chunks = [];
+    for (let i = 0; i < this.totalChunks; i++) {
+      const start = i * this.chunkSize;
+      const end   = Math.min(start + this.chunkSize, file.size);
+      chunks.push(await file.slice(start, end).arrayBuffer());
+    }
+    return chunks;
   }
 
   async delete() {
@@ -109,6 +111,7 @@ class OPFSChunkStore {
       try { await this._writable.close(); } catch { /* ignore */ }
       this._closed = true;
     }
+    this._fileCache = null;
     try {
       const root = await navigator.storage.getDirectory();
       await root.removeEntry(this.fileHandle.name);
@@ -116,7 +119,7 @@ class OPFSChunkStore {
   }
 }
 
-// ── IndexedDB implementation (unchanged) ────────────────────────────────────
+// ── IndexedDB implementation ─────────────────────────────────────────────────
 
 class IDBChunkStore {
   constructor(db, dbName, chunkSize, totalChunks) {
@@ -131,8 +134,8 @@ class IDBChunkStore {
     const db = await new Promise((resolve, reject) => {
       const req = indexedDB.open(dbName, 1);
       req.onupgradeneeded = () => req.result.createObjectStore('chunks');
-      req.onsuccess = () => resolve(req.result);
-      req.onerror   = () => reject(req.error);
+      req.onsuccess       = () => resolve(req.result);
+      req.onerror         = () => reject(req.error);
     });
     return new IDBChunkStore(db, dbName, chunkSize, totalChunks);
   }
@@ -163,9 +166,8 @@ class IDBChunkStore {
     return chunks;
   }
 
-  async flush() {
-    // IDB writes are durable per-transaction — nothing to do.
-  }
+  /** IDB writes are durable per-transaction — nothing to do. */
+  async flush() {}
 
   async delete() {
     this.db.close();
