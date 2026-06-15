@@ -60,6 +60,7 @@ export default function useFileTransfer({ dataChannel, role, file }) {
   const lastSnapshotRef = useRef({ bytes: 0, time: Date.now() });
   const chunksBufferRef = useRef([]);  // accumulates chunks without triggering renders
   const metaRef         = useRef(null);
+  const isSendingRef = useRef(false);
 
   // ── Speed tracking helper ──────────────────────────────────────────────
   const updateSpeed = useCallback((totalBytesNow) => {
@@ -79,6 +80,8 @@ export default function useFileTransfer({ dataChannel, role, file }) {
     if (role !== 'sender' || !dataChannel || !file) return;
 
     const sendFile = async () => {
+      if (isSendingRef.current) return;
+  isSendingRef.current = true;
       try {
         setStatus('transferring');
         setTotalBytes(file.size);
@@ -94,10 +97,19 @@ export default function useFileTransfer({ dataChannel, role, file }) {
           chunkArrays.push(buffer.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE));
         }
 
-        const [chunkHashes, fileHash] = await Promise.all([
-          Promise.all(chunkArrays.map(sha256hex)),
-          sha256hex(buffer),
-        ]);
+        // 1. Hash the full file first
+        const fileHash = await sha256hex(buffer);
+
+        // 2. Hash chunks sequentially to prevent thread starvation
+        const chunkHashes = [];
+        for (let i = 0; i < numChunks; i++) {
+          chunkHashes.push(await sha256hex(chunkArrays[i]));
+          
+          // Yield to the event loop every 50 chunks so WebRTC doesn't disconnect
+          if (i % 50 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+          }
+        }
 
         // Send metadata first
         const metadata = {
@@ -110,7 +122,18 @@ export default function useFileTransfer({ dataChannel, role, file }) {
           chunkHashes,
           fileHash,
         };
-        dataChannel.send(JSON.stringify(metadata));
+        
+        // 1. Check if the receiver dropped while we were hashing
+        if (dataChannel.readyState !== 'open') {
+          throw new Error('Connection lost while preparing the file for transfer.');
+        }
+
+        // 2. Safely attempt to send the metadata
+        try {
+          dataChannel.send(JSON.stringify(metadata));
+        } catch (err) {
+          throw new Error('Failed to send metadata. The receiver may have disconnected.');
+        }
 
         // Send chunks with backpressure handling
         let bytesSent = 0;
@@ -118,7 +141,7 @@ export default function useFileTransfer({ dataChannel, role, file }) {
           const chunk = chunkArrays[i];
 
           // Wait for buffer to drain if it's too full
-          if (dataChannel.bufferedAmount > 16 * 1024 * 1024) {
+          if (dataChannel.bufferedAmount > dataChannel.bufferedAmountLowThreshold) {
             await new Promise((resolve) => {
               dataChannel.onbufferedamountlow = () => {
                 dataChannel.onbufferedamountlow = null;
@@ -160,6 +183,9 @@ export default function useFileTransfer({ dataChannel, role, file }) {
   useEffect(() => {
     if (role !== 'receiver' || !dataChannel) return;
 
+    const chunkIdxRef = useRef(0);
+    const verifiedCountRef = useRef(0);
+
     const handleMessage = async (event) => {
       // First message: JSON metadata
       if (typeof event.data === 'string') {
@@ -186,7 +212,7 @@ export default function useFileTransfer({ dataChannel, role, file }) {
       if (!meta) return;
 
       const chunk = event.data;
-      const idx   = chunksBufferRef.current.length;
+      const idx   = chunkIdxRef.current++;
 
       // Verify chunk hash
       const hash = await sha256hex(chunk);
@@ -196,16 +222,16 @@ export default function useFileTransfer({ dataChannel, role, file }) {
         return;
       }
 
-      chunksBufferRef.current.push(chunk);
-      const received    = chunksBufferRef.current.length;
-      const bytesNow    = received * meta.chunkSize;
+      chunksBufferRef.current[idx] = chunk;
+      const verified    = ++verifiedCountRef.current;
+      const bytesNow    = verified * meta.chunkSize;
 
-      setChunksReceived(received);
+      setChunksReceived(verified);
       setBytesTransferred(Math.min(bytesNow, meta.size));
-      setProgress(Math.round((received / meta.totalChunks) * 100));
+      setProgress(Math.round((verified / meta.totalChunks) * 100));
       updateSpeed(bytesNow);
 
-      if (received === meta.totalChunks) {
+      if (verified === meta.totalChunks) {
         setStatus('verifying');
         setTransferSpeed(0);
 
